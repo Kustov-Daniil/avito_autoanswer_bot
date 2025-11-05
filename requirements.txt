@@ -1,0 +1,8 @@
+aiogram==3.4.1
+Flask==3.0.2
+python-dotenv==1.0.1
+openai==1.43.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+# Note: pydantic>=2.5.0 is required for Python 3.13 compatibility
+# aiogram 3.4.1 may show version warnings but works with newer pydantic
