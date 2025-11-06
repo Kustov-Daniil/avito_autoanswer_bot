@@ -67,6 +67,44 @@ git push origin main
 
 ## Устранение проблем
 
+### ⚠️ Ошибка "Permission denied (publickey,password)" - ЧАСТАЯ ПРОБЛЕМА
+
+**Причина:** SSH ключ не настроен правильно или не добавлен в GitHub Secrets.
+
+**Быстрое решение:**
+
+1. **Проверьте SSH ключ локально:**
+```bash
+ssh -i ~/.ssh/github_actions_deploy root@your-server-ip
+```
+
+Если не работает, скопируйте ключ на сервер:
+```bash
+ssh-copy-id -i ~/.ssh/github_actions_deploy.pub root@your-server-ip
+chmod 600 ~/.ssh/github_actions_deploy
+```
+
+2. **Проверьте GitHub Secrets:**
+   - GitHub → Settings → Secrets and variables → Actions
+   - Убедитесь, что `SSH_PRIVATE_KEY` добавлен
+   - Убедитесь, что `SERVER_HOST` добавлен
+
+3. **Проверьте формат SSH_PRIVATE_KEY:**
+   - Должен начинаться с `-----BEGIN OPENSSH PRIVATE KEY-----`
+   - Должен заканчиваться `-----END OPENSSH PRIVATE KEY-----`
+   - Все строки между должны быть скопированы
+
+4. **Пересоздайте ключ, если нужно:**
+```bash
+rm ~/.ssh/github_actions_deploy ~/.ssh/github_actions_deploy.pub
+ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/github_actions_deploy
+# На оба запроса пароля нажмите Enter
+ssh-copy-id -i ~/.ssh/github_actions_deploy.pub root@your-server-ip
+cat ~/.ssh/github_actions_deploy  # Скопируйте и обновите в GitHub Secrets
+```
+
+**Подробная инструкция:** См. [TROUBLESHOOTING_ACTIONS.md](TROUBLESHOOTING_ACTIONS.md)
+
 ### Ошибка "Permission denied (publickey)"
 
 1. Убедитесь, что публичный ключ добавлен на сервер:
