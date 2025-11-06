@@ -294,7 +294,7 @@ def send_text_message(chat_id: str, text: str) -> bool:
             return True
         else:
             # Детальное логирование ошибки
-            response_text = r.text[:1000] if r.text else "(empty response)"
+            response_text = r.text[:2000] if r.text else "(пустой ответ)"
             error_details = {
                 "status_code": r.status_code,
                 "response_text": response_text,
@@ -302,21 +302,34 @@ def send_text_message(chat_id: str, text: str) -> bool:
                 "account_id": AVITO_ACCOUNT_ID,
                 "url": url
             }
-            logger.error("send_text_message failed: %s", error_details)
+            logger.error("❌ ОШИБКА ОТПРАВКИ СООБЩЕНИЯ В AVITO")
+            logger.error("Статус код: %s", r.status_code)
+            logger.error("Chat ID: %s", chat_id)
+            logger.error("Account ID: %s", AVITO_ACCOUNT_ID)
+            logger.error("Длина текста: %d символов", len(text))
+            logger.error("Ответ от API: %s", response_text)
             
             # Анализ ошибки из JSON ответа
-            response_text_for_log = r.text[:1000] if r.text else "(empty response)"
+            response_text_for_log = r.text[:2000] if r.text else "(пустой ответ)"
             _log_api_error(r.status_code, response_text_for_log, error_details)
             
             return False
             
     except requests.exceptions.RequestException as e:
-        logger.exception("Request exception in send_text_message: %s, chat_id=%s, account_id=%s", 
-                        e, chat_id, AVITO_ACCOUNT_ID)
+        logger.error("❌ ОШИБКА СЕТЕВОГО ЗАПРОСА ПРИ ОТПРАВКЕ СООБЩЕНИЯ")
+        logger.error("Тип ошибки: %s", type(e).__name__)
+        logger.error("Сообщение: %s", str(e))
+        logger.error("Chat ID: %s", chat_id)
+        logger.error("Account ID: %s", AVITO_ACCOUNT_ID)
+        logger.exception("Полная информация об ошибке:")
         return False
     except Exception as e:
-        logger.exception("Unexpected exception in send_text_message: %s, chat_id=%s, account_id=%s", 
-                        e, chat_id, AVITO_ACCOUNT_ID)
+        logger.error("❌ НЕОЖИДАННАЯ ОШИБКА ПРИ ОТПРАВКЕ СООБЩЕНИЯ")
+        logger.error("Тип ошибки: %s", type(e).__name__)
+        logger.error("Сообщение: %s", str(e))
+        logger.error("Chat ID: %s", chat_id)
+        logger.error("Account ID: %s", AVITO_ACCOUNT_ID)
+        logger.exception("Полная информация об ошибке:")
         return False
 
 
@@ -330,37 +343,46 @@ def _log_api_error(status_code: int, response_text: str, error_details: Dict[str
         error_details: Дополнительные детали ошибки
     """
     try:
-        if response_text:
+        if response_text and response_text != "(пустой ответ)":
             import json
-            error_json = json.loads(response_text)
-            logger.error("Error JSON: %s", error_json)
-            
-            if "error" in error_json:
-                error_info = error_json.get("error")
-                logger.error("API Error: %s", error_info)
+            try:
+                error_json = json.loads(response_text)
+                logger.error("📋 JSON ответ от API: %s", json.dumps(error_json, ensure_ascii=False, indent=2))
                 
-                # Специальная обработка для 403 ошибки
+                if "error" in error_json:
+                    error_info = error_json.get("error")
+                    logger.error("🔴 Информация об ошибке: %s", error_info)
+                    
+                    # Выводим все поля ошибки
+                    if isinstance(error_info, dict):
+                        for key, value in error_info.items():
+                            logger.error("   %s: %s", key, value)
+                
+                # Специальная обработка для разных статус кодов
                 if status_code == 403:
-                    _log_403_error(error_info)
+                    _log_403_error(error_info if "error" in error_json else None)
                 
-                # Специальная обработка для 400 ошибки
                 if status_code == 400:
-                    _log_400_error(error_info, error_details)
+                    _log_400_error(error_info if "error" in error_json else None, error_details)
                 
-                # Специальная обработка для 404 ошибки
                 if status_code == 404:
-                    _log_404_error(error_info, error_details)
+                    _log_404_error(error_info if "error" in error_json else None, error_details)
                 
                 if "message" in error_json:
-                    logger.error("API Error message: %s", error_json.get("message"))
+                    logger.error("💬 Сообщение об ошибке от API: %s", error_json.get("message"))
+            except json.JSONDecodeError:
+                logger.error("⚠️ Ответ от API не является валидным JSON")
+                logger.error("📄 Сырой ответ: %s", response_text[:1000])
         else:
-            logger.error("Empty response body from API")
+            logger.error("⚠️ Пустой ответ от API")
             if status_code == 400:
-                logger.error("400 Bad Request with empty response - возможно проблема с форматом запроса")
+                logger.error("❌ 400 Bad Request с пустым ответом - возможно проблема с форматом запроса")
+                logger.error("   Проверьте формат данных в запросе")
             elif status_code == 404:
                 _log_404_error(None, error_details)
-    except ValueError:
-        logger.error("Could not parse error response as JSON. Raw response: %s", response_text[:1000])
+    except Exception as e:
+        logger.error("❌ Ошибка при обработке ответа от API: %s", e)
+        logger.error("📄 Сырой ответ: %s", response_text[:2000] if response_text else "(нет ответа)")
 
 
 def _log_403_error(error_info: Any) -> None:

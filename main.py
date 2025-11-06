@@ -10,19 +10,20 @@ import logging
 import re
 import json
 import os
+import shutil
 from datetime import datetime
 from typing import Dict, Any, Optional, Callable, Awaitable, List
 from flask import Flask, request, jsonify, Response
 from aiogram import F
-from aiogram.types import Message
+from aiogram.types import Message, MessageReactionUpdated
 
 from create_bot import bot, dp
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from config import (
-    TELEGRAM_MANAGER_ID, TELEGRAM_BOT_TOKEN,
+    TELEGRAM_MANAGER_ID, TELEGRAM_MANAGERS, TELEGRAM_BOT_TOKEN,
     AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_ACCOUNT_ID,
-    SIGNAL_PHRASES, DATA_DIR
+    SIGNAL_PHRASES, DATA_DIR, COOLDOWN_MINUTES_AFTER_MANAGER, ADMINS, FAQ_PATH
 )
 from avito_api import send_message, list_messages_v3
 from avito_sessions import can_bot_reply, set_waiting_manager, set_cooldown_after_manager
@@ -71,9 +72,10 @@ FLASK_HOST: str = "0.0.0.0"
 FLASK_PORT: int = 8080
 
 # Регулярные выражения для извлечения данных
-CHAT_ID_PATTERN_HTML: re.Pattern = re.compile(r"Avito Chat ID:\s*<code>(.*?)</code>|<code>([0-9a-zA-Z:_-]+)</code>")
-CHAT_ID_PATTERN_TEXT: re.Pattern = re.compile(r"Avito Chat ID:\s*([0-9a-zA-Z:_-]+)|([0-9a-zA-Z:_-]+)$")
-AVITO_CHAT_ID_PATTERN: re.Pattern = re.compile(r"(?i)Avito Chat ID[:\s]*([0-9a-zA-Z:_-]+)|<code>([0-9a-zA-Z:_-]+)</code>|([0-9a-zA-Z:_-]+)$")
+# Паттерны для извлечения chat_id (должны включать тильду ~)
+CHAT_ID_PATTERN_HTML: re.Pattern = re.compile(r"Avito Chat ID:\s*<code>(.*?)</code>|<code>([0-9a-zA-Z:_\-~]+)</code>")
+CHAT_ID_PATTERN_TEXT: re.Pattern = re.compile(r"Avito Chat ID:\s*([0-9a-zA-Z:_\-~]+)|([0-9a-zA-Z:_\-~]+)$")
+AVITO_CHAT_ID_PATTERN: re.Pattern = re.compile(r"(?i)Avito Chat ID[:\s]*([0-9a-zA-Z:_\-~]+)|<code>([0-9a-zA-Z:_\-~]+)</code>|([0-9a-zA-Z:_\-~]+)$")
 
 
 def check_config() -> bool:
@@ -87,8 +89,8 @@ def check_config() -> bool:
     
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
-    if not TELEGRAM_MANAGER_ID:
-        missing.append("TELEGRAM_MANAGER_ID")
+    if not TELEGRAM_MANAGERS:
+        missing.append("MANAGERS или TELEGRAM_MANAGER_ID")
     if not AVITO_CLIENT_ID:
         missing.append("AVITO_CLIENT_ID")
     if not AVITO_CLIENT_SECRET:
@@ -103,7 +105,8 @@ def check_config() -> bool:
     
     logger.info("Configuration check passed:")
     logger.info("  TELEGRAM_BOT_TOKEN: %s", "✓" if TELEGRAM_BOT_TOKEN else "✗")
-    logger.info("  TELEGRAM_MANAGER_ID: %s", TELEGRAM_MANAGER_ID)
+    logger.info("  ADMINS: %s", ADMINS if ADMINS else "✗ NOT SET!")
+    logger.info("  TELEGRAM_MANAGERS: %s", TELEGRAM_MANAGERS if TELEGRAM_MANAGERS else "✗ NOT SET!")
     logger.info("  AVITO_CLIENT_ID: %s", "✓" if AVITO_CLIENT_ID else "✗")
     logger.info("  AVITO_CLIENT_SECRET: %s", "✓" if AVITO_CLIENT_SECRET else "✗")
     logger.info("  AVITO_ACCOUNT_ID: %s", AVITO_ACCOUNT_ID if AVITO_ACCOUNT_ID else "✗ NOT SET!")
@@ -178,7 +181,7 @@ async def _notify_manager_for_chat(
         data: Данные webhook от Avito
         thread_bot: Экземпляр бота для отправки сообщений
     """
-    logger.info("Notifying manager for chat %s", chat_id)
+    logger.info("📨 Уведомление менеджеров для чата %s", chat_id)
     
     # Получаем информацию о чате и историю сообщений из Avito
     chat_info: Optional[Dict[str, Any]] = None
@@ -234,13 +237,98 @@ async def _notify_manager_for_chat(
         chat_id, text, history, chat_info=chat_info, user_name=user_name
     )
     
-    # Отправляем уведомление менеджеру
-    await safe_send_message_to_chat(
-        thread_bot,
-        TELEGRAM_MANAGER_ID,
-        notification_text
-    )
-    logger.info("Sent notification to manager for chat %s", chat_id)
+    # Отправляем уведомление всем менеджерам
+    if not TELEGRAM_MANAGERS:
+        logger.error("❌ Список менеджеров пуст! Не могу отправить уведомление для чата %s", chat_id)
+        logger.error("   Установите переменную MANAGERS в .env (например: MANAGERS=123456789,987654321)")
+        return
+    
+    success_count = 0
+    for manager_id in TELEGRAM_MANAGERS:
+        try:
+            await safe_send_message_to_chat(
+                thread_bot,
+                manager_id,
+                notification_text
+            )
+            success_count += 1
+            logger.info("✅ Уведомление отправлено менеджеру %d для чата %s", manager_id, chat_id)
+        except Exception as e:
+            logger.error("❌ Ошибка при отправке уведомления менеджеру %d для чата %s: %s", manager_id, chat_id, e)
+    
+    logger.info("📨 Уведомления отправлены %d из %d менеджеров для чата %s", success_count, len(TELEGRAM_MANAGERS), chat_id)
+
+
+def _add_manager_reply_to_faq(notification_message: Message, manager_answer: str) -> None:
+    """
+    Добавляет ответ менеджера в FAQ автоматически.
+    
+    Извлекает вопрос клиента из уведомления и добавляет пару вопрос-ответ в FAQ.
+    Использует единую функцию добавления FAQ с проверкой уникальности и валидацией.
+    
+    Args:
+        notification_message: Сообщение-уведомление от бота (reply_to_message)
+        manager_answer: Ответ менеджера
+    """
+    try:
+        if not notification_message or not notification_message.text:
+            return
+        
+        notification_text = notification_message.text
+        
+        # Извлекаем вопрос клиента из уведомления
+        # Ищем строку "💬 ТЕКУЩЕЕ СООБЩЕНИЕ:" и текст после "👤 {client_name}:"
+        question = None
+        
+        # Паттерн для извлечения вопроса клиента
+        # Формат: "💬 ТЕКУЩЕЕ СООБЩЕНИЕ:\n👤 {client_name}: {question}"
+        current_message_match = re.search(r'💬\s*ТЕКУЩЕЕ\s*СООБЩЕНИЕ[:\s]*\n.*?👤\s*[^:]+:\s*(.+?)(?:\n|$)', notification_text, re.IGNORECASE | re.DOTALL)
+        if current_message_match:
+            question = current_message_match.group(1).strip()
+        
+        # Если не нашли, пробуем найти в истории переписки (последнее сообщение от клиента)
+        if not question:
+            # Ищем последнее сообщение клиента в истории
+            history_match = re.search(r'👤\s*[^:]+:\s*(.+?)(?:\n|$)', notification_text, re.IGNORECASE | re.DOTALL)
+            if history_match:
+                question = history_match.group(1).strip()
+        
+        if not question:
+            logger.warning("Не удалось извлечь вопрос клиента из уведомления для добавления в FAQ. Текст уведомления: %s", notification_text[:500])
+            return
+        
+        if not manager_answer:
+            logger.warning("Ответ менеджера пуст, не добавляем в FAQ")
+            return
+        
+        logger.info("Попытка добавить ответ менеджера в FAQ: вопрос='%s', ответ='%s' (длина: %d)", 
+                   question[:100], manager_answer[:100], len(manager_answer))
+        
+        # Используем единую функцию добавления FAQ с проверкой уникальности и валидацией
+        from user_bot import _add_faq_entry_safe
+        success, message = _add_faq_entry_safe(question, manager_answer, "manager")
+        
+        if success:
+            logger.info("✅ Ответ менеджера автоматически добавлен в FAQ: вопрос='%s'", question[:50])
+        else:
+            logger.warning("❌ Ответ менеджера не добавлен в FAQ: %s (вопрос: '%s', ответ: '%s')", 
+                          message, question[:50], manager_answer[:50])
+    except Exception as e:
+        logger.exception("Ошибка при добавлении ответа менеджера в FAQ: %s", e)
+
+
+def _add_manager_reply_to_faq_by_text(message_text: str, manager_answer: str) -> None:
+    """
+    Добавляет ответ менеджера в FAQ автоматически (для отправки по тексту).
+    
+    Args:
+        message_text: Текст сообщения менеджера (может содержать chat_id)
+        manager_answer: Ответ менеджера (текст после chat_id)
+    """
+    # Для отправки по тексту вопрос клиента не доступен напрямую
+    # Можно добавить только ответ, но без вопроса это не очень полезно
+    # Поэтому просто логируем
+    logger.debug("Отправка по тексту - вопрос клиента недоступен для добавления в FAQ")
 
 
 def format_manager_text_with_history(
@@ -263,6 +351,19 @@ def format_manager_text_with_history(
     Returns:
         Отформатированный текст уведомления с историей
     """
+    # Загружаем историю из chat_history.json
+    chat_history_from_file = []
+    try:
+        from responder import _load_json, CHAT_HISTORY_PATH
+        all_chat_history = _load_json(CHAT_HISTORY_PATH, {})
+        dialog_id = f"avito_{chat_id}"
+        if dialog_id in all_chat_history:
+            chat_history_from_file = all_chat_history[dialog_id]
+            # Берем последние 5 сообщений
+            chat_history_from_file = chat_history_from_file[-5:]
+            logger.info("Загружено %d сообщений из chat_history для чата %s", len(chat_history_from_file), chat_id)
+    except Exception as e:
+        logger.warning("Не удалось загрузить историю из chat_history.json для чата %s: %s", chat_id, e)
     # Извлекаем имя клиента из chat_info или используем переданное
     client_name = user_name or "Клиент"
     if chat_info:
@@ -278,12 +379,33 @@ def format_manager_text_with_history(
         elif isinstance(user_info, str):
             client_name = user_info
     
-    # Форматируем текущее сообщение
-    header = f"{client_name}: {current_message}"
-    
-    # Форматируем историю сообщений
+    # Форматируем историю из chat_history.json (последние 5 сообщений)
     history_lines = []
-    if history:
+    if chat_history_from_file:
+        for msg in chat_history_from_file:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if not content or not content.strip():
+                continue
+            
+            # Определяем отправителя и иконку
+            if role == "user":
+                sender_icon = "👤"
+                sender_name = client_name
+            elif role == "assistant":
+                sender_icon = "🤖"
+                sender_name = "Бот"
+            else:
+                sender_icon = "💬"
+                sender_name = "Система"
+            
+            # Форматируем сообщение
+            history_lines.append(f"{sender_icon} {sender_name}: {content}")
+    
+    # Если нет истории из файла, используем историю из Avito API
+    if not history_lines and history:
         # Проверяем, если history это список или словарь с вложенным списком
         if isinstance(history, dict):
             messages_list = history.get("messages") or history.get("items") or history.get("value", {}).get("messages") or []
@@ -385,13 +507,11 @@ def format_manager_text_with_history(
                 # Неизвестное направление - считаем системным
                 sender = "Системное"
             
-            # Форматируем строку истории
+            # Форматируем строку истории (используем только если нет истории из файла)
             if date_str:
                 history_lines.append(f"{date_str} {sender}: {msg_text}")
             else:
                 history_lines.append(f"{sender}: {msg_text}")
-    
-    history_text = "\n".join(history_lines) if history_lines else ""
     
     # Форматируем информацию о чате
     chat_details = []
@@ -509,28 +629,42 @@ def format_manager_text_with_history(
         if chat_id:
             chat_details.append(f"Chat ID: {chat_id}")
     
-    # Формируем секцию ОТВЕТЫ (ответы менеджера из Telegram)
-    # Пока оставляем пустым, так как нужно хранить историю ответов менеджера
-    answers_section = "ОТВЕТЫ:\n\n"
+    # Формируем красивое сообщение для менеджера
+    message_parts = []
     
-    # Формируем финальное сообщение
-    parts = [header]
+    # Заголовок с иконкой
+    message_parts.append("🔔 НОВОЕ СООБЩЕНИЕ ОТ КЛИЕНТА")
+    message_parts.append("=" * 50)
+    message_parts.append("")
     
-    if history_text:
-        parts.append("")
-        parts.append("ИСТОРИЯ")
-        parts.append("")
-        parts.append(history_text)
-    
+    # Информация о чате
     if chat_details:
-        parts.append("")
-        parts.extend(chat_details)
+        message_parts.append("📋 ИНФОРМАЦИЯ О ЧАТЕ:")
+        for detail in chat_details:
+            message_parts.append(f"   {detail}")
+        message_parts.append("")
     
-    parts.append("")
-    parts.append(answers_section)
-    parts.append(f"<code>{chat_id}</code>")
+    # Текущее сообщение клиента
+    message_parts.append("💬 ТЕКУЩЕЕ СООБЩЕНИЕ:")
+    message_parts.append(f"👤 {client_name}: {current_message}")
+    message_parts.append("")
     
-    return "\n".join(parts)
+    # История переписки (последние 5 сообщений)
+    if history_lines:
+        message_parts.append("📜 ИСТОРИЯ ПЕРЕПИСКИ (последние 5 сообщений):")
+        message_parts.append("")
+        for line in history_lines:
+            message_parts.append(f"   {line}")
+        message_parts.append("")
+    
+    # Chat ID для ответа
+    message_parts.append("=" * 50)
+    message_parts.append("💬 Чтобы ответить клиенту, ответьте на это сообщение")
+    message_parts.append("")
+    message_parts.append(f"📎 Avito Chat ID:")
+    message_parts.append(f"<code>{chat_id}</code>")
+    
+    return "\n".join(message_parts)
 
 
 def extract_chat_id_from_webhook(data: Dict[str, Any]) -> Optional[str]:
@@ -797,13 +931,13 @@ def avito_webhook() -> Response:
                     meta = {}
                 meta["contains_signal_phrase"] = True
             else:
-                logger.info("Generated reply for chat %s, answer_length=%d", chat_id, len(answer))
+                logger.info("✅ Ответ от LLM сгенерирован для чата %s, длина: %d символов", chat_id, len(answer))
                 
                 # Avito API ограничение: текст не должен превышать ~1000 символов (лучше 950)
                 MAX_AVITO_MESSAGE_LENGTH = 950
                 if len(answer) > MAX_AVITO_MESSAGE_LENGTH:
                     logger.warning(
-                        "Answer too long (%d chars), truncating to %d chars for Avito",
+                        "⚠️ Ответ слишком длинный (%d символов), обрезаю до %d символов для Avito",
                         len(answer), MAX_AVITO_MESSAGE_LENGTH
                     )
                     # Обрезаем до 950 символов, стараясь не обрезать слово посередине
@@ -813,40 +947,39 @@ def avito_webhook() -> Response:
                     if last_space > MAX_AVITO_MESSAGE_LENGTH - 50:  # Если пробел не слишком далеко
                         truncated = truncated[:last_space]
                     answer = truncated + "..."
-                    logger.info("Answer truncated to %d chars", len(answer))
+                    logger.info("✂️ Ответ обрезан до %d символов", len(answer))
                 
                 logger.info(
-                    "Attempting to send message to Avito: account_id=%s, chat_id=%s, answer_length=%d",
+                    "📤 Отправка сообщения в Avito: account_id=%s, chat_id=%s, длина ответа=%d символов",
                     AVITO_ACCOUNT_ID, chat_id, len(answer)
-                )
-                
-                logger.info(
-                    "About to call send_message: chat_id=%s, answer_length=%d, account_id=%s",
-                    chat_id, len(answer), AVITO_ACCOUNT_ID
                 )
                 
                 try:
                     ok = send_message(chat_id, answer)
                     logger.info(
-                        "send_message returned for chat %s: ok=%s",
-                        chat_id, ok
+                        "📨 Результат отправки сообщения для чата %s: %s",
+                        chat_id, "✅ Успешно" if ok else "❌ Ошибка"
                     )
                     
                     if not ok:
                         logger.error(
-                            "❌ send_message returned False for chat %s - check avito_api logs for details",
+                            "❌ Не удалось отправить сообщение в Avito для чата %s",
                             chat_id
                         )
                         logger.error(
-                            "Failed to send: chat_id=%s, answer_length=%d, account_id=%s",
+                            "   Chat ID: %s, Длина ответа: %d символов, Account ID: %s",
                             chat_id, len(answer), AVITO_ACCOUNT_ID
                         )
+                        logger.error("   Подробности ошибки смотрите в логах avito_api.py выше")
                 except Exception as e:
-                    logger.exception("Exception in send_message for chat %s: %s", chat_id, e)
+                    logger.error("❌ Исключение при отправке сообщения для чата %s", chat_id)
+                    logger.error("   Тип ошибки: %s", type(e).__name__)
+                    logger.error("   Сообщение: %s", str(e))
+                    logger.exception("   Полная информация об ошибке:")
                     ok = False
                 
                 if ok:
-                    logger.info("✅ Auto-reply sent successfully to Avito chat %s", chat_id)
+                    logger.info("✅ Автоответ успешно отправлен в Avito для чата %s", chat_id)
                     
                     # Сохраняем ответ в историю ТОЛЬКО после успешной отправки
                     try:
@@ -855,10 +988,18 @@ def avito_webhook() -> Response:
                         dialog_id = f"avito_{chat_id}"
                         dialog_history = chat_history.get(dialog_id, [])
                         
-                        # Добавляем ответ ассистента в историю
-                        dialog_history.append({"role": "assistant", "content": answer})
-                        # Ограничиваем историю последними 6 сообщениями перед сохранением (MAX_HISTORY_MESSAGES = 6)
-                        chat_history[dialog_id] = dialog_history[-6:]
+                        # Добавляем ответ ассистента в историю с информацией о токенах и временной меткой
+                        from datetime import datetime
+                        assistant_entry = {
+                            "role": "assistant",
+                            "content": answer,
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        if "usage" in meta:
+                            assistant_entry["usage"] = meta["usage"]
+                        dialog_history.append(assistant_entry)
+                        # Сохраняем всю историю (без ограничений)
+                        chat_history[dialog_id] = dialog_history
                         _save_json(CHAT_HISTORY_PATH, chat_history)
                         
                         logger.info(
@@ -1022,24 +1163,62 @@ async def manager_reply_handler(message: Message) -> None:
         await safe_send_message(message, "Пустое сообщение не отправлено.")
         return
 
-    logger.info("Sending manager reply to Avito: chat_id=%s, text_length=%d", chat_id, len(text_to_send))
+    logger.info("📤 Отправка ответа менеджера в Avito: chat_id=%s, длина текста=%d символов", chat_id, len(text_to_send))
+    logger.info("   Извлеченный chat_id: %s (длина: %d символов)", chat_id, len(chat_id))
+    
+    # Проверяем, что chat_id выглядит полным (должен содержать тильду или быть достаточно длинным)
+    if '~' not in chat_id and len(chat_id) < 25:
+        logger.warning("⚠️ Chat ID выглядит неполным: %s (ожидается формат: u2i-...~...)", chat_id)
+        logger.warning("   Попробуйте ответить на уведомление, где chat_id указан полностью")
+    
     ok = send_message(chat_id, text_to_send)
     if ok:
-        logger.info("Manager reply sent successfully to chat_id=%s, setting cooldown", chat_id)
+        logger.info("✅ Ответ менеджера успешно отправлен в Avito для chat_id=%s, устанавливаю cooldown", chat_id)
         set_cooldown_after_manager(chat_id)
+        
+        # Сохраняем ответ менеджера в историю
+        try:
+            from responder import _load_json, _save_json, CHAT_HISTORY_PATH
+            chat_history = _load_json(CHAT_HISTORY_PATH, {})
+            dialog_id = f"avito_{chat_id}"
+            dialog_history = chat_history.get(dialog_id, [])
+            
+            # Добавляем ответ менеджера в историю с временной меткой
+            dialog_history.append({
+                "role": "manager",
+                "content": text_to_send,
+                "timestamp": datetime.now().isoformat()
+            })
+            # Сохраняем всю историю (без ограничений)
+            chat_history[dialog_id] = dialog_history
+            _save_json(CHAT_HISTORY_PATH, chat_history)
+            
+            logger.info(
+                "Saved manager message to chat history for dialog_id=%s: %d messages",
+                dialog_id, len(chat_history[dialog_id])
+            )
+        except Exception as e:
+            logger.warning("Failed to save manager message to chat history: %s", e)
+        
+        # Автоматически добавляем ответ менеджера в FAQ
+        _add_manager_reply_to_faq(replied, text_to_send)
+        
         await safe_send_message(
-            message, "Ответ менеджера отправлен в Avito. Бот снова активируется через 15 минут."
+            message, f"✅ Ответ менеджера отправлен в Avito. Бот снова активируется через {COOLDOWN_MINUTES_AFTER_MANAGER} минут."
         )
     else:
-        logger.error("Failed to send message to Avito chat_id=%s, text_length=%d", chat_id, len(text_to_send))
+        logger.error("❌ Не удалось отправить ответ менеджера в Avito")
+        logger.error("   Chat ID: %s (длина: %d символов)", chat_id, len(chat_id))
+        logger.error("   Длина текста: %d символов", len(text_to_send))
+        logger.error("   Проверьте логи avito_api.py выше для деталей ошибки")
         # Не устанавливаем cooldown, если отправка не удалась
         await safe_send_message(
-            message, f"Ошибка при отправке ответа в Avito (chat_id: {chat_id}). Проверьте логи/настройки."
+            message, f"❌ Ошибка при отправке ответа в Avito (chat_id: {chat_id}). Проверьте логи/настройки."
         )
 
 
 # Отправка без reply — если в тексте есть "Avito Chat ID: <id>"
-@dp.message(F.text.regexp(r"(?i)Avito Chat ID[:\s]*([0-9a-zA-Z:_-]+)") & ~F.reply_to_message)
+@dp.message(F.text.regexp(r"(?i)Avito Chat ID[:\s]*([0-9a-zA-Z:_\-~]+)") & ~F.reply_to_message)
 async def manager_send_by_text(message: Message) -> None:
     """
     Обрабатывает сообщение менеджера с Avito Chat ID в тексте.
@@ -1064,17 +1243,130 @@ async def manager_send_by_text(message: Message) -> None:
         await safe_send_message(message, "После Avito Chat ID добавьте текст ответа для клиента.")
         return
     
+    logger.info("📤 Отправка ответа менеджера в Avito (без reply): chat_id=%s, длина текста=%d символов", chat_id, len(text_to_send))
+    logger.info("   Извлеченный chat_id: %s (длина: %d символов)", chat_id, len(chat_id))
+    
+    # Проверяем, что chat_id выглядит полным
+    if '~' not in chat_id and len(chat_id) < 25:
+        logger.warning("⚠️ Chat ID выглядит неполным: %s (ожидается формат: u2i-...~...)", chat_id)
+    
     ok = send_message(chat_id, text_to_send)
     if ok:
+        logger.info("✅ Ответ менеджера успешно отправлен в Avito для chat_id=%s, устанавливаю cooldown", chat_id)
         set_cooldown_after_manager(chat_id)
+        
+        # Сохраняем ответ менеджера в историю
+        try:
+            from responder import _load_json, _save_json, CHAT_HISTORY_PATH
+            chat_history = _load_json(CHAT_HISTORY_PATH, {})
+            dialog_id = f"avito_{chat_id}"
+            dialog_history = chat_history.get(dialog_id, [])
+            
+            # Добавляем ответ менеджера в историю с временной меткой
+            dialog_history.append({
+                "role": "manager",
+                "content": text_to_send,
+                "timestamp": datetime.now().isoformat()
+            })
+            # Сохраняем всю историю (без ограничений)
+            chat_history[dialog_id] = dialog_history
+            _save_json(CHAT_HISTORY_PATH, chat_history)
+            
+            logger.info(
+                "Saved manager message to chat history for dialog_id=%s: %d messages",
+                dialog_id, len(chat_history[dialog_id])
+            )
+        except Exception as e:
+            logger.warning("Failed to save manager message to chat history: %s", e)
+        
+        # Автоматически добавляем ответ менеджера в FAQ
+        # Для отправки по тексту вопрос клиента недоступен, но можно добавить только ответ
+        _add_manager_reply_to_faq_by_text(message.text or "", text_to_send)
+        
         await safe_send_message(
-            message, "Ответ менеджера отправлен в Avito. Бот снова активируется через 15 минут."
+            message, f"✅ Ответ менеджера отправлен в Avito. Бот снова активируется через {COOLDOWN_MINUTES_AFTER_MANAGER} минут."
         )
     else:
-        logger.error("Failed to send message to Avito chat_id=%s, text_length=%d", chat_id, len(text_to_send))
+        logger.error("❌ Не удалось отправить ответ менеджера в Avito")
+        logger.error("   Chat ID: %s (длина: %d символов)", chat_id, len(chat_id))
+        logger.error("   Длина текста: %d символов", len(text_to_send))
+        logger.error("   Проверьте логи avito_api.py выше для деталей ошибки")
         await safe_send_message(
-            message, f"Ошибка при отправке ответа в Avito (chat_id: {chat_id}). Проверьте логи/настройки."
+            message, f"❌ Ошибка при отправке ответа в Avito (chat_id: {chat_id}). Проверьте логи/настройки."
         )
+
+
+# Обработчик реакций на сообщения менеджера
+@dp.message_reaction()
+async def handle_manager_message_reaction(update: MessageReactionUpdated) -> None:
+    """
+    Обрабатывает реакции на сообщения менеджера.
+    
+    Если менеджер ставит 👍 на свой ответ (reply на уведомление бота),
+    обновляет source в FAQ на "manager_like".
+    
+    Args:
+        update: Обновление реакции на сообщение
+    """
+    try:
+        # Проверяем, что это реакция 👍 (thumbs up)
+        if not update.new_reaction:
+            return
+        
+        # Проверяем, что это реакция 👍
+        has_thumbs_up = False
+        for reaction in update.new_reaction:
+            # Проверяем различные варианты эмодзи 👍
+            if hasattr(reaction, 'emoji') and reaction.emoji in ['👍', '👍🏻', '👍🏼', '👍🏽', '👍🏾', '👍🏿']:
+                has_thumbs_up = True
+                break
+            # Также проверяем тип реакции (если используется ReactionType)
+            if hasattr(reaction, 'type') and hasattr(reaction.type, 'emoji'):
+                if reaction.type.emoji in ['👍', '👍🏻', '👍🏼', '👍🏽', '👍🏾', '👍🏿']:
+                    has_thumbs_up = True
+                    break
+        
+        if not has_thumbs_up:
+            return
+        
+        # Получаем ID сообщения, на которое поставлена реакция
+        message_id = update.message_id
+        chat_id = update.chat.id
+        user_id = update.user.id if update.user else None
+        
+        logger.info("Получена реакция 👍 на сообщение message_id=%s в чате %s от пользователя %s", 
+                   message_id, chat_id, user_id)
+        
+        # Загружаем FAQ и ищем запись с этим message_id
+        try:
+            with open(FAQ_PATH, "r", encoding="utf-8") as f:
+                current_faq = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            logger.warning("Не удалось загрузить FAQ для обновления source")
+            return
+        
+        # Ищем запись по последнему сообщению менеджера с source="manager" или "user_like"
+        # Поскольку manager_message_id больше не сохраняется, ищем последнюю запись от менеджера или user_like
+        updated = False
+        # Ищем последнюю запись с source="manager" или "user_like" (предполагаем, что это последний ответ)
+        for item in reversed(current_faq):
+            source = item.get("source", "")
+            if source == "manager" or source == "user_like":
+                item["source"] = "manager_like"
+                updated = True
+                logger.info("✅ Обновлен source на 'manager_like' для записи (было: '%s', message_id=%s)", source, message_id)
+                break
+        
+        if updated:
+            # Сохраняем обновленный FAQ
+            os.makedirs(os.path.dirname(FAQ_PATH), exist_ok=True)
+            with open(FAQ_PATH, "w", encoding="utf-8") as f:
+                json.dump(current_faq, f, ensure_ascii=False, indent=2)
+        else:
+            logger.debug("Не найдена запись в FAQ для обновления source (message_id=%s)", message_id)
+            
+    except Exception as e:
+        logger.exception("Ошибка при обработке реакции на сообщение менеджера: %s", e)
 
 
 def run_flask() -> None:

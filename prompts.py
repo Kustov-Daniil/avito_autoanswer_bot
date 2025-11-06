@@ -2,42 +2,44 @@
 Модуль формирования промптов для LLM.
 
 Содержит шаблоны и функции для построения промптов на основе
-статического контекста, истории диалога, FAQ и дополнительных данных.
+статического контекста, динамического контекста, системного промпта,
+истории диалога, FAQ и дополнительных данных.
 """
+import logging
 
-# Системный промпт для LLM
-SYSTEM_HINT: str = (
-    "Ты — вежливый визовый помощник. "
-    "Отвечай кратко и по делу, с примерами и шагами, когда уместно. "
-    "ВАЖНО: Твой ответ не должен превышать 900 символов (ограничение Avito API). "
-    "Будь лаконичен, но информативен. Если нужно много информации — выдели самое важное. "
-    "Если информации недостаточно — укажи, что нужны уточнения. "
-    "Если вопрос выходит за твои рамки или информации нет в FAQ/контексте — "
-    "напиши фразу: 'По данному вопросу вам в ближайшее время ответит наш менеджер.' "
-    "Эта фраза будет удалена из ответа клиенту, но используется для уведомления менеджера."
+logger = logging.getLogger(__name__)
+
+# Жестко зашитая часть системного промпта (всегда присутствует)
+HARDCODED_SYSTEM_PART: str = (
+    "ВАЖНО: Твой ответ не должен превышать 950 символов (ограничение Avito API). "
+    "Ты — вежливый визовый помощник. Будь лаконичен, но информативен. Если нужно много информации — выдели самое важное."
+    "Убирай звездочки из ответов, телеграм их не понимает"
 )
 
-# Шаблон промпта
-PROMPT_TEMPLATE: str = """{system_hint}
 
-Необходимая информация о тарифах и услугах, типовые ответы на вопросы и описание профиля ассистента:
+# Шаблон промпта
+PROMPT_TEMPLATE: str = """{system_prompt}
+
+{hardcoded_system_part}
+
+Статическая информация о компании, услугах и профиле ассистента:
 {static_context}
 
-История переписки с клиентом:
+Динамическая информация о тарифах, услугах, стоимостях (актуальная на сегодня):
+{dynamic_context}
+
+История переписки с клиентом (последние сообщения):
 {dialogue_context}
 
 Найденные похожие вопросы и ответы из FAQ:
 {faq_context}
 
-Дополнительная вложенная история (если есть):
-{embedded_history}
-
-ВАЖНО: Если в FAQ или статическом контексте нет информации для ответа на вопрос клиента, 
+ВАЖНО: Если в FAQ или контексте нет информации для ответа на вопрос клиента, 
 или если вопрос выходит за рамки твоих знаний — ОБЯЗАТЕЛЬНО напиши фразу: 
 "По данному вопросу вам в ближайшее время ответит наш менеджер."
 
 Имя клиента: {user_name}
-Последнее сообщение от клиента:
+Последний вопрос от клиента на который ты должен ответить:
 {incoming_text}
 """
 
@@ -45,16 +47,16 @@ PROMPT_TEMPLATE: str = """{system_hint}
 DEFAULT_STATIC_CONTEXT: str = "(нет)"
 DEFAULT_DIALOGUE_CONTEXT: str = "(нет)"
 DEFAULT_FAQ_CONTEXT: str = "(нет)"
-DEFAULT_EMBEDDED_HISTORY: str = "(нет)"
 DEFAULT_USER_NAME: str = "(неизвестно)"
 DEFAULT_INCOMING_TEXT: str = "(пусто)"
 
 
 def build_prompt(
+    system_prompt: str,
     static_context: str,
+    dynamic_context: str,
     dialogue_context: str,
     faq_context: str,
-    embedded_history: str,
     user_name: str | None,
     incoming_text: str
 ) -> str:
@@ -62,22 +64,37 @@ def build_prompt(
     Формирует промпт для LLM на основе всех контекстов.
     
     Args:
+        system_prompt: Системный промпт из файла (описание манеры поведения ассистента)
         static_context: Статический контекст (информация о компании, услугах)
-        dialogue_context: История диалога
+        dynamic_context: Динамический контекст (тарифы, услуги, стоимости)
+        dialogue_context: История диалога из chat_history.json (последние сообщения)
         faq_context: Релевантные вопросы и ответы из FAQ
-        embedded_history: Дополнительная вложенная история
         user_name: Имя пользователя (опционально)
         incoming_text: Входящий текст от пользователя
         
     Returns:
         Сформированный промпт для отправки в LLM
     """
-    return PROMPT_TEMPLATE.format(
-        system_hint=SYSTEM_HINT,
+    # Используем системный промпт из файла, если он есть, иначе - пустая строка
+    # Жестко зашитая часть про 950 символов всегда добавляется отдельно
+    system_hint = system_prompt.strip() if system_prompt.strip() else ""
+    
+    prompt = PROMPT_TEMPLATE.format(
+        system_prompt=system_hint,
+        hardcoded_system_part=HARDCODED_SYSTEM_PART,
         static_context=static_context or DEFAULT_STATIC_CONTEXT,
+        dynamic_context=dynamic_context or "(нет)",
         dialogue_context=dialogue_context or DEFAULT_DIALOGUE_CONTEXT,
         faq_context=faq_context or DEFAULT_FAQ_CONTEXT,
-        embedded_history=embedded_history or DEFAULT_EMBEDDED_HISTORY,
         user_name=user_name or DEFAULT_USER_NAME,
         incoming_text=incoming_text or DEFAULT_INCOMING_TEXT,
     )
+    
+    # Выводим итоговый промпт в консоль для отладки
+    print("\n" + "=" * 80)
+    print("ИТОГОВЫЙ ПРОМПТ ДЛЯ LLM:")
+    print("=" * 80)
+    print(prompt)
+    print("=" * 80 + "\n")
+    
+    return prompt

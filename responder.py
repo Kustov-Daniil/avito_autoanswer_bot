@@ -15,17 +15,20 @@ from openai import AsyncOpenAI
 
 from config import (
     LLM_MODEL, TEMPERATURE, OPENAI_API_KEY,
-    DATA_DIR, FAQ_PATH, STATIC_CONTEXT_PATH, CHAT_HISTORY_PATH,
+    DATA_DIR, FAQ_PATH, STATIC_CONTEXT_PATH, DYNAMIC_CONTEXT_PATH, SYSTEM_PROMPT_PATH, CHAT_HISTORY_PATH,
     SIGNAL_PHRASES,
 )
+from avito_sessions import get_llm_model
 from prompts import build_prompt
 
 logger = logging.getLogger(__name__)
 
 # Константы
 MAX_HISTORY_MESSAGES: int = 6
-MAX_FAQ_MATCHES: int = 3
-FAQ_SIMILARITY_CUTOFF: float = 0.55
+MAX_FAQ_MATCHES: int = 5  # Увеличено для лучшего покрытия контекста
+FAQ_SIMILARITY_CUTOFF: float = 0.50  # Базовый порог (адаптивный)
+FAQ_SIMILARITY_CUTOFF_MIN: float = 0.45  # Минимальный порог для коротких текстов
+FAQ_SIMILARITY_CUTOFF_MAX: float = 0.65  # Максимальный порог для длинных текстов
 
 # Инициализация OpenAI клиента
 if not OPENAI_API_KEY:
@@ -49,6 +52,12 @@ if not os.path.exists(FAQ_PATH):
         json.dump([], f, ensure_ascii=False)
 if not os.path.exists(STATIC_CONTEXT_PATH):
     with open(STATIC_CONTEXT_PATH, "w", encoding="utf-8") as f:
+        f.write("")
+if not os.path.exists(DYNAMIC_CONTEXT_PATH):
+    with open(DYNAMIC_CONTEXT_PATH, "w", encoding="utf-8") as f:
+        f.write("")
+if not os.path.exists(SYSTEM_PROMPT_PATH):
+    with open(SYSTEM_PROMPT_PATH, "w", encoding="utf-8") as f:
         f.write("")
 if not os.path.exists(CHAT_HISTORY_PATH):
     with open(CHAT_HISTORY_PATH, "w", encoding="utf-8") as f:
@@ -91,9 +100,60 @@ def _save_json(path: str, data: Any) -> None:
         raise
 
 
+def _normalize_text(text: str) -> str:
+    """
+    Нормализует текст для лучшего сравнения.
+    
+    Args:
+        text: Исходный текст
+        
+    Returns:
+        Нормализованный текст (lowercase, без лишних пробелов)
+    """
+    if not text:
+        return ""
+    # Приводим к нижнему регистру и убираем лишние пробелы
+    normalized = text.lower().strip()
+    # Убираем множественные пробелы
+    normalized = re.sub(r'\s+', ' ', normalized)
+    return normalized
+
+
+def _calculate_adaptive_cutoff(text: str) -> float:
+    """
+    Вычисляет адаптивный порог схожести в зависимости от длины текста.
+    
+    Для коротких текстов (1-3 слова) используем более низкий порог,
+    для длинных текстов - более высокий.
+    
+    Args:
+        text: Входящий текст
+        
+    Returns:
+        Адаптивный порог схожести (0.45 - 0.65)
+    """
+    words = len(text.split())
+    
+    if words <= 3:
+        # Короткие вопросы - более низкий порог для улавливания вариаций
+        return FAQ_SIMILARITY_CUTOFF_MIN
+    elif words <= 10:
+        # Средние вопросы - базовый порог
+        return FAQ_SIMILARITY_CUTOFF
+    else:
+        # Длинные вопросы - более высокий порог для точности
+        return FAQ_SIMILARITY_CUTOFF_MAX
+
+
 def _build_faq_context(incoming_text: str, faq_data: List[Dict[str, str]]) -> str:
     """
     Строит контекст из FAQ на основе схожести с входящим текстом.
+    
+    Использует улучшенный алгоритм поиска:
+    - Нормализация текста (lowercase, удаление лишних пробелов)
+    - Адаптивный порог схожести в зависимости от длины текста
+    - Приоритет совпадений по вопросам над совпадениями по ответам
+    - Поиск по ключевым словам в дополнение к SequenceMatcher
     
     Args:
         incoming_text: Входящий текст пользователя
@@ -105,46 +165,89 @@ def _build_faq_context(incoming_text: str, faq_data: List[Dict[str, str]]) -> st
     if not faq_data or not incoming_text:
         return ""
     
-    questions = [item.get("question", "") for item in faq_data if item.get("question")]
-    answers = [item.get("answer", "") for item in faq_data if item.get("answer")]
+    # Нормализуем входящий текст
+    normalized_incoming = _normalize_text(incoming_text)
     
-    # Находим похожие вопросы
+    # Вычисляем адаптивный порог
+    adaptive_cutoff = _calculate_adaptive_cutoff(normalized_incoming)
+    
+    # Извлекаем ключевые слова из входящего текста (слова длиннее 3 символов)
+    incoming_words = set(word for word in normalized_incoming.split() if len(word) > 3)
+    
+    # Подготавливаем данные для поиска
+    questions = []
+    question_to_item = {}
+    
+    for item in faq_data:
+        q = item.get("question", "")
+        if q:
+            normalized_q = _normalize_text(q)
+            questions.append(normalized_q)
+            question_to_item[normalized_q] = item
+    
+    # Находим похожие вопросы с адаптивным порогом
     matched_questions = difflib.get_close_matches(
-        incoming_text, questions, n=MAX_FAQ_MATCHES, cutoff=FAQ_SIMILARITY_CUTOFF
+        normalized_incoming, questions, n=MAX_FAQ_MATCHES * 2, cutoff=adaptive_cutoff
     )
     
-    # Находим похожие ответы
-    matched_answers = difflib.get_close_matches(
-        incoming_text, answers, n=MAX_FAQ_MATCHES, cutoff=FAQ_SIMILARITY_CUTOFF
-    )
+    # Дополнительный поиск по ключевым словам
+    keyword_matches = []
+    for q in questions:
+        q_words = set(word for word in q.split() if len(word) > 3)
+        # Вычисляем пересечение ключевых слов
+        common_words = incoming_words & q_words
+        if common_words:
+            # Оценка релевантности на основе количества общих слов
+            relevance_score = len(common_words) / max(len(incoming_words), len(q_words))
+            if relevance_score >= 0.3:  # Порог для ключевых слов
+                keyword_matches.append((q, relevance_score))
     
-    parts = []
+    # Сортируем по релевантности
+    keyword_matches.sort(key=lambda x: x[1], reverse=True)
+    keyword_questions = [q for q, _ in keyword_matches[:MAX_FAQ_MATCHES]]
+    
+    # Объединяем результаты (приоритет SequenceMatcher, затем ключевые слова)
+    all_matched_questions = []
     seen = set()
     
-    # Добавляем вопросы и ответы
+    # Сначала добавляем совпадения из SequenceMatcher
     for q in matched_questions:
         if q not in seen:
-            a = next((i["answer"] for i in faq_data if i.get("question") == q), None)
-            if a:
-                parts.append(f"Вопрос: {q}\nОтвет: {a}")
-                seen.add(q)
+            all_matched_questions.append(q)
+            seen.add(q)
     
-    for a in matched_answers:
-        if a not in seen:
-            q = next((i["question"] for i in faq_data if i.get("answer") == a), None)
-            if q:
-                parts.append(f"Вопрос: {q}\nОтвет: {a}")
-                seen.add(a)
+    # Затем добавляем совпадения по ключевым словам
+    for q in keyword_questions:
+        if q not in seen and len(all_matched_questions) < MAX_FAQ_MATCHES:
+            all_matched_questions.append(q)
+            seen.add(q)
     
-    return "\n\n".join(parts[:MAX_FAQ_MATCHES])
+    # Формируем результат
+    parts = []
+    for q in all_matched_questions[:MAX_FAQ_MATCHES]:
+        item = question_to_item.get(q)
+        if item:
+            question = item.get("question", "")
+            answer = item.get("answer", "")
+            if question and answer:
+                parts.append(f"Вопрос: {question}\nОтвет: {answer}")
+    
+    result = "\n\n".join(parts)
+    
+    if result:
+        logger.debug(
+            "FAQ context built: incoming_text_length=%d, matches=%d, cutoff=%.2f",
+            len(incoming_text), len(parts), adaptive_cutoff
+        )
+    
+    return result
 
 
 async def generate_reply(
     dialog_id: str,
     incoming_text: str,
     *,
-    user_name: Optional[str] = None,
-    embedded_history: str = ""
+    user_name: Optional[str] = None
 ) -> Tuple[Optional[str], Dict[str, bool]]:
     """
     Генерирует ответ на основе входящего текста, FAQ и истории диалога.
@@ -155,7 +258,6 @@ async def generate_reply(
         dialog_id: Уникальный ID диалога (например, "avito_123" или "tg_456")
         incoming_text: Входящий текст от пользователя
         user_name: Имя пользователя (опционально)
-        embedded_history: Вложенная история диалога (опционально)
         
     Returns:
         Кортеж (answer_text, {"contains_signal_phrase": bool})
@@ -180,12 +282,17 @@ async def generate_reply(
     # Ограничиваем историю последними N сообщениями (исключая новое сообщение)
     dialog_history_for_context = dialog_history[-MAX_HISTORY_MESSAGES:] if dialog_history else []
     
-    # Добавляем новое сообщение пользователя в историю (для сохранения)
+    # Добавляем новое сообщение пользователя в историю (для сохранения) с временной меткой
     # Но НЕ сохраняем ответ ассистента здесь - это будет сделано в main.py после успешной отправки
-    dialog_history.append({"role": "user", "content": incoming_text})
+    from datetime import datetime
+    dialog_history.append({
+        "role": "user",
+        "content": incoming_text,
+        "timestamp": datetime.now().isoformat()
+    })
     
-    # Сохраняем сообщение пользователя в историю
-    chat_history[dialog_id] = dialog_history[-MAX_HISTORY_MESSAGES:]
+    # Сохраняем сообщение пользователя в историю (сохраняем всю историю, без ограничений)
+    chat_history[dialog_id] = dialog_history
     _save_json(CHAT_HISTORY_PATH, chat_history)
     
     logger.info(
@@ -193,15 +300,32 @@ async def generate_reply(
         dialog_id, len(chat_history[dialog_id])
     )
     
-    # Загружаем FAQ и статический контекст
+    # Загружаем FAQ и контексты
     faq_data = _load_json(FAQ_PATH, [])
     
+    # Загружаем статический контекст
     try:
         with open(STATIC_CONTEXT_PATH, "r", encoding="utf-8") as f:
             static_context = f.read().strip()
     except (FileNotFoundError, IOError) as e:
         logger.warning("Failed to load static context: %s", e)
         static_context = ""
+    
+    # Загружаем динамический контекст
+    try:
+        with open(DYNAMIC_CONTEXT_PATH, "r", encoding="utf-8") as f:
+            dynamic_context = f.read().strip()
+    except (FileNotFoundError, IOError) as e:
+        logger.warning("Failed to load dynamic context: %s", e)
+        dynamic_context = ""
+    
+    # Загружаем системный промпт
+    try:
+        with open(SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
+            system_prompt = f.read().strip()
+    except (FileNotFoundError, IOError) as e:
+        logger.warning("Failed to load system prompt: %s", e)
+        system_prompt = ""
     
     # Строим контексты - используем историю БЕЗ нового сообщения пользователя для контекста
     # (новое сообщение передается отдельно в incoming_text)
@@ -219,17 +343,21 @@ async def generate_reply(
     
     # Формируем промпт
     prompt = build_prompt(
+        system_prompt=system_prompt,
         static_context=static_context,
+        dynamic_context=dynamic_context,
         dialogue_context=dialogue_context,
         faq_context=faq_context,
-        embedded_history=embedded_history,
         user_name=user_name,
         incoming_text=incoming_text,
     )
     
+    # Получаем актуальную модель LLM
+    current_model = get_llm_model(LLM_MODEL)
+    
     logger.info(
         "Calling LLM for dialog_id=%s, model=%s, prompt_length=%d",
-        dialog_id, LLM_MODEL, len(prompt)
+        dialog_id, current_model, len(prompt)
     )
     
     # Проверяем, что клиент инициализирован
@@ -241,22 +369,22 @@ async def generate_reply(
     try:
         # Проверяем, поддерживает ли модель temperature
         # Для gpt-5-mini и некоторых других моделей temperature не поддерживается
-        use_temperature = LLM_MODEL not in ["gpt-5-mini", "gpt-5"]
+        use_temperature = current_model not in ["gpt-5-mini", "gpt-5"]
         
         logger.info(
             "Creating chat completion: model=%s, use_temperature=%s, temperature=%s",
-            LLM_MODEL, use_temperature, TEMPERATURE if use_temperature else "N/A"
+            current_model, use_temperature, TEMPERATURE if use_temperature else "N/A"
         )
         
         if use_temperature:
             response = await client.chat.completions.create(
-                model=LLM_MODEL,
+                model=current_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=TEMPERATURE,
             )
         else:
             response = await client.chat.completions.create(
-                model=LLM_MODEL,
+                model=current_model,
                 messages=[{"role": "user", "content": prompt}],
             )
         
@@ -272,6 +400,20 @@ async def generate_reply(
         else:
             answer = ""
         
+        # Извлекаем информацию о токенах
+        usage_info = {}
+        if hasattr(response, 'usage') and response.usage:
+            usage_info = {
+                "prompt_tokens": getattr(response.usage, 'prompt_tokens', 0),
+                "completion_tokens": getattr(response.usage, 'completion_tokens', 0),
+                "total_tokens": getattr(response.usage, 'total_tokens', 0),
+                "model": current_model
+            }
+            logger.info(
+                "Token usage for dialog_id=%s: prompt=%d, completion=%d, total=%d",
+                dialog_id, usage_info["prompt_tokens"], usage_info["completion_tokens"], usage_info["total_tokens"]
+            )
+        
         logger.info("LLM answer extracted: length=%d, preview=%s", len(answer), answer[:100] if answer else "EMPTY")
         
         if not answer:
@@ -283,6 +425,11 @@ async def generate_reply(
         logger.error("Full error details: type=%s, args=%s", type(e).__name__, e.args)
         # При ошибке переводим на менеджера
         return None, {"contains_signal_phrase": True}
+    
+    # Включаем информацию о токенах в meta
+    meta = {"contains_signal_phrase": False}
+    if usage_info:
+        meta["usage"] = usage_info
     
     # Проверяем наличие сигнальной фразы (для внутренней логики)
     answer_lower = answer.lower()
@@ -298,4 +445,7 @@ async def generate_reply(
     # НЕ сохраняем ответ в историю здесь - это будет сделано в main.py после успешной отправки
     # Это нужно, чтобы не сохранять ответы, которые не были отправлены клиенту
     
-    return answer, {"contains_signal_phrase": contains_signal}
+    # Обновляем meta с информацией о сигнальной фразе
+    meta["contains_signal_phrase"] = contains_signal
+    
+    return answer, meta
