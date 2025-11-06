@@ -229,9 +229,6 @@ python manage.py send-image <chat_id> <file_path>
 Подробные инструкции по развертыванию на сервере и настройке автоматического деплоя через GitHub Actions:
 
 - **[INSTALL.md](INSTALL.md)** - Автоматическая установка (одна команда) ⭐
-- **[QUICK_START_DEPLOY.md](QUICK_START_DEPLOY.md)** - Быстрый старт развертывания
-- **[DEPLOYMENT.md](DEPLOYMENT.md)** - Полная инструкция по развертыванию на VDS
-- **[WEBHOOK_SETUP.md](WEBHOOK_SETUP.md)** - Настройка webhook (nginx) на VDS
 - **[GITHUB_ACTIONS_SETUP.md](GITHUB_ACTIONS_SETUP.md)** - Настройка GitHub Actions для автоматического деплоя
 
 ### Быстрый старт развертывания

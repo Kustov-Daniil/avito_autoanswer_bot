@@ -103,8 +103,6 @@ ssh-copy-id -i ~/.ssh/github_actions_deploy.pub root@your-server-ip
 cat ~/.ssh/github_actions_deploy  # Скопируйте и обновите в GitHub Secrets
 ```
 
-**Подробная инструкция:** См. [TROUBLESHOOTING_ACTIONS.md](TROUBLESHOOTING_ACTIONS.md)
-
 ### Ошибка "Permission denied (publickey)"
 
 1. Убедитесь, что публичный ключ добавлен на сервер:
@@ -140,6 +138,48 @@ ssh root@93.183.91.110 "systemctl status ssh"
 ### Ошибка при выполнении команд на сервере
 
 Проверьте логи GitHub Actions - там будет подробная информация об ошибке.
+
+## Дополнительные проблемы и решения
+
+### Ошибка "rsync: connection unexpectedly closed"
+
+**Причина:** Проблемы с синхронизацией файлов.
+
+**Решение:**
+1. Проверьте, что директория существует на сервере:
+```bash
+ssh root@your-server-ip "ls -la /home/avito_autoanswer_bot"
+```
+
+2. Проверьте права доступа:
+```bash
+ssh root@your-server-ip "chmod -R 755 /home/avito_autoanswer_bot"
+```
+
+### Ошибка "Host key verification failed"
+
+**Решение:** Это нормально при первом подключении. GitHub Actions автоматически добавит сервер в known_hosts через `ssh-keyscan` в workflow.
+
+### Ошибка "Connection refused"
+
+**Решение:**
+1. Проверьте доступность сервера: `ping your-server-ip`
+2. Проверьте SSH порт: `telnet your-server-ip 22`
+3. Проверьте SSH сервис: `ssh root@your-server-ip "systemctl status ssh"`
+4. Проверьте firewall: `ssh root@your-server-ip "ufw status"`
+
+### Ошибка при выполнении команд на сервере
+
+**Решение:**
+1. Проверьте логи GitHub Actions
+2. Выполните команды вручную на сервере:
+```bash
+ssh root@your-server-ip
+cd /home/avito_autoanswer_bot
+source venv/bin/activate
+pip install -r requirements.txt
+systemctl restart avito_autoanswer_bot.service
+```
 
 ## Безопасность
 
