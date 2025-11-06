@@ -305,8 +305,8 @@ def _add_manager_reply_to_faq(notification_message: Message, manager_answer: str
                    question[:100], manager_answer[:100], len(manager_answer))
         
         # Используем единую функцию добавления FAQ с проверкой уникальности и валидацией
-        from user_bot import _add_faq_entry_safe
-        success, message = _add_faq_entry_safe(question, manager_answer, "manager")
+        from utils.faq_utils import add_faq_entry_safe
+        success, message = add_faq_entry_safe(question, manager_answer, "manager")
         
         if success:
             logger.info("✅ Ответ менеджера автоматически добавлен в FAQ: вопрос='%s'", question[:50])
@@ -983,29 +983,11 @@ def avito_webhook() -> Response:
                     
                     # Сохраняем ответ в историю ТОЛЬКО после успешной отправки
                     try:
-                        from responder import _load_json, _save_json, CHAT_HISTORY_PATH
-                        chat_history = _load_json(CHAT_HISTORY_PATH, {})
+                        from utils.chat_history import save_assistant_message
                         dialog_id = f"avito_{chat_id}"
-                        dialog_history = chat_history.get(dialog_id, [])
-                        
-                        # Добавляем ответ ассистента в историю с информацией о токенах и временной меткой
-                        from datetime import datetime
-                        assistant_entry = {
-                            "role": "assistant",
-                            "content": answer,
-                            "timestamp": datetime.now().isoformat()
-                        }
-                        if "usage" in meta:
-                            assistant_entry["usage"] = meta["usage"]
-                        dialog_history.append(assistant_entry)
-                        # Сохраняем всю историю (без ограничений)
-                        chat_history[dialog_id] = dialog_history
-                        _save_json(CHAT_HISTORY_PATH, chat_history)
-                        
-                        logger.info(
-                            "Saved chat history for dialog_id=%s: %d messages (after successful send)",
-                            dialog_id, len(chat_history[dialog_id])
-                        )
+                        usage = meta.get("usage") if "usage" in meta else None
+                        save_assistant_message(dialog_id, answer, usage)
+                        logger.info("Saved chat history for dialog_id=%s (after successful send)", dialog_id)
                     except Exception as e:
                         logger.warning("Failed to save chat history after sending: %s", e)
                     
@@ -1059,6 +1041,8 @@ def avito_webhook() -> Response:
                 await _notify_manager_for_chat(chat_id, text, data, thread_bot)
             else:
                 logger.info("No signal phrase detected, skipping manager notification for chat %s", chat_id)
+        except Exception as e:
+            logger.exception("Ошибка при обработке webhook для чата %s: %s", chat_id, e)
         finally:
             await thread_bot.session.close()
 
@@ -1170,7 +1154,7 @@ async def manager_reply_handler(message: Message) -> None:
     if '~' not in chat_id and len(chat_id) < 25:
         logger.warning("⚠️ Chat ID выглядит неполным: %s (ожидается формат: u2i-...~...)", chat_id)
         logger.warning("   Попробуйте ответить на уведомление, где chat_id указан полностью")
-    
+
     ok = send_message(chat_id, text_to_send)
     if ok:
         logger.info("✅ Ответ менеджера успешно отправлен в Avito для chat_id=%s, устанавливаю cooldown", chat_id)
@@ -1257,25 +1241,10 @@ async def manager_send_by_text(message: Message) -> None:
         
         # Сохраняем ответ менеджера в историю
         try:
-            from responder import _load_json, _save_json, CHAT_HISTORY_PATH
-            chat_history = _load_json(CHAT_HISTORY_PATH, {})
+            from utils.chat_history import save_manager_message
             dialog_id = f"avito_{chat_id}"
-            dialog_history = chat_history.get(dialog_id, [])
-            
-            # Добавляем ответ менеджера в историю с временной меткой
-            dialog_history.append({
-                "role": "manager",
-                "content": text_to_send,
-                "timestamp": datetime.now().isoformat()
-            })
-            # Сохраняем всю историю (без ограничений)
-            chat_history[dialog_id] = dialog_history
-            _save_json(CHAT_HISTORY_PATH, chat_history)
-            
-            logger.info(
-                "Saved manager message to chat history for dialog_id=%s: %d messages",
-                dialog_id, len(chat_history[dialog_id])
-            )
+            save_manager_message(dialog_id, text_to_send)
+            logger.info("Saved manager message to chat history for dialog_id=%s", dialog_id)
         except Exception as e:
             logger.warning("Failed to save manager message to chat history: %s", e)
         

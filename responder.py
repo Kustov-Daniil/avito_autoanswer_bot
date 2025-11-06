@@ -282,23 +282,12 @@ async def generate_reply(
     # Ограничиваем историю последними N сообщениями (исключая новое сообщение)
     dialog_history_for_context = dialog_history[-MAX_HISTORY_MESSAGES:] if dialog_history else []
     
-    # Добавляем новое сообщение пользователя в историю (для сохранения) с временной меткой
-    # Но НЕ сохраняем ответ ассистента здесь - это будет сделано в main.py после успешной отправки
-    from datetime import datetime
-    dialog_history.append({
-        "role": "user",
-        "content": incoming_text,
-        "timestamp": datetime.now().isoformat()
-    })
-    
     # Сохраняем сообщение пользователя в историю (сохраняем всю историю, без ограничений)
-    chat_history[dialog_id] = dialog_history
-    _save_json(CHAT_HISTORY_PATH, chat_history)
+    # Но НЕ сохраняем ответ ассистента здесь - это будет сделано в main.py после успешной отправки
+    from utils.chat_history import save_user_message
+    save_user_message(dialog_id, incoming_text)
     
-    logger.info(
-        "Saved user message to chat history for dialog_id=%s: %d messages",
-        dialog_id, len(chat_history[dialog_id])
-    )
+    logger.info("Saved user message to chat history for dialog_id=%s", dialog_id)
     
     # Загружаем FAQ и контексты
     faq_data = _load_json(FAQ_PATH, [])

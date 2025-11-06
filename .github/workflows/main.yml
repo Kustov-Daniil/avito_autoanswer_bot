@@ -1,0 +1,27 @@
+name: Deploy avito_autoanswer_bot Telegram Bot
+
+on:
+  push:
+    branches: 
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Start SSH Agent
+      run: eval "$(ssh-agent -s)"
+
+    - name: Setup SSH
+      uses: webfactory/ssh-agent@v0.5.3
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Deploy to Server
+      run: |
+        rsync -avz -e "ssh -o StrictHostKeyChecking=no" ./ root@93.183.91.110:/home/avito_autoanswer_bot/
+        ssh -o StrictHostKeyChecking=no root@93.183.91.110 "sudo systemctl restart avito_autoanswer_bot.service"

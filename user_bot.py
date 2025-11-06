@@ -35,6 +35,12 @@ from config import (
 from avito_sessions import set_bot_enabled, is_bot_enabled, get_llm_model, set_llm_model
 from responder import generate_reply
 from avito_api import subscribe_webhook, unsubscribe_webhook
+from utils.chat_history import save_assistant_message
+from utils.faq_utils import (
+    load_faq_safe, save_faq_safe, validate_faq_entry,
+    add_faq_entry_safe, add_faq_entries_batch, parse_faq_text
+)
+from utils.stats import calculate_stats, calculate_token_cost
 
 # Константы
 MAX_FAQ_CHUNK_SIZE: int = 6000
@@ -91,45 +97,6 @@ def _check_admin(user_id: int) -> bool:
     return user_id in ADMINS if ADMINS else False
 
 
-def _calculate_token_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    """
-    Рассчитывает стоимость использования токенов для указанной модели.
-    
-    Args:
-        model: Название модели (например, "gpt-4o", "gpt-5", "gpt-5-mini")
-        prompt_tokens: Количество токенов в промпте
-        completion_tokens: Количество токенов в ответе
-        
-    Returns:
-        Стоимость в долларах США
-    """
-    # Цены на модели OpenAI (на 1M токенов)
-    # Источник: https://openai.com/api/pricing/ (примерные цены, нужно обновлять)
-    pricing = {
-        "gpt-4o": {
-            "input": 2.50,   # $2.50 за 1M input tokens
-            "output": 10.00  # $10.00 за 1M output tokens
-        },
-        "gpt-5": {
-            "input": 2.50,   # Предположительно похожие цены
-            "output": 10.00
-        },
-        "gpt-5-mini": {
-            "input": 0.15,   # $0.15 за 1M input tokens (дешевле)
-            "output": 0.60   # $0.60 за 1M output tokens
-        }
-    }
-    
-    # Получаем цены для модели или используем значения по умолчанию
-    model_pricing = pricing.get(model, pricing["gpt-4o"])
-    
-    # Рассчитываем стоимость
-    input_cost = (prompt_tokens / 1_000_000) * model_pricing["input"]
-    output_cost = (completion_tokens / 1_000_000) * model_pricing["output"]
-    
-    return input_cost + output_cost
-
-
 def _calculate_stats() -> Dict[str, Any]:
     """
     Вычисляет статистику работы бота на основе chat_history.json и FAQ.
@@ -162,7 +129,7 @@ def _calculate_stats() -> Dict[str, Any]:
     
     # Загружаем FAQ для статистики (используем безопасную загрузку)
     try:
-        faq_data, _ = _load_faq_safe()
+        faq_data, _ = load_faq_safe()
         if not isinstance(faq_data, list):
             logger.warning("FAQ данные не являются списком, используем пустой список")
             faq_data = []
@@ -226,7 +193,7 @@ def _calculate_stats() -> Dict[str, Any]:
                         total_tokens += prompt_tokens + completion_tokens
                         
                         # Рассчитываем стоимость в долларах
-                        cost_usd = _calculate_token_cost(model, prompt_tokens, completion_tokens)
+                        cost_usd = calculate_token_cost(model, prompt_tokens, completion_tokens)
                         total_cost_usd += cost_usd
                 
                 # Проверяем, является ли это переходом на менеджера
@@ -698,7 +665,7 @@ async def cmd_stats(message: Message, state: FSMContext) -> None:
     await state.clear()
     
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        stats = _calculate_stats()
+        stats = calculate_stats()
         
         text = (
             "📊 <b>Статистика работы бота</b>\n\n"
@@ -1255,7 +1222,7 @@ async def handle_faq_file(message: Message, state: FSMContext) -> None:
                         })
         else:
             # Для других форматов парсим текст
-            parsed_faq = _parse_faq_text(new_content)
+            parsed_faq = parse_faq_text(new_content)
             # Добавляем source для всех записей
             new_faq = [
                 {**item, "source": "admin"}  # Добавлено админом через загрузку файла
@@ -1263,7 +1230,7 @@ async def handle_faq_file(message: Message, state: FSMContext) -> None:
             ]
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("Не удалось распарсить файл как JSON, пробуем как текст: %s", e)
-        parsed_faq = _parse_faq_text(new_content)
+        parsed_faq = parse_faq_text(new_content)
         # Добавляем source для всех записей
         new_faq = [
             {**item, "source": "admin"}  # Добавлено админом через загрузку файла
@@ -1282,7 +1249,7 @@ async def handle_faq_file(message: Message, state: FSMContext) -> None:
                 for i in range(0, len(new_content), MAX_FAQ_CHUNK_SIZE)
             ]
             logger.info("Файл разделен на %d частей для обработки LLM", len(chunks))
-            
+
             all_new_faq = []
             
             # Обрабатываем каждую часть через LLM
@@ -1388,403 +1355,11 @@ async def handle_faq_file(message: Message, state: FSMContext) -> None:
             os.remove(file_path)
         except Exception:
             pass
-    await state.clear()
+        await state.clear()
 
 
-def _load_faq_safe() -> tuple[List[Dict[str, Any]], int]:
-    """
-    Безопасно загружает FAQ с защитой от потери данных.
-    
-    Returns:
-        Кортеж (список FAQ, количество записей)
-    """
-    from responder import _load_json
-    backup_path = f"{FAQ_PATH}.backup"
-    original_faq_count = 0
-    current_faq = None
-    
-    try:
-        with open(FAQ_PATH, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            if not content:
-                logger.warning("FAQ файл пуст, пробуем восстановить из резервной копии")
-                raise ValueError("FAQ файл пуст")
-            current_faq = json.loads(content)
-        # Проверяем, что это список
-        if not isinstance(current_faq, list):
-            logger.error("FAQ файл не содержит список, пробуем восстановить из резервной копии")
-            raise ValueError("FAQ файл не содержит список")
-        else:
-            original_faq_count = len(current_faq)
-            logger.debug("Загружен FAQ: %d записей", original_faq_count)
-    except FileNotFoundError:
-        logger.warning("FAQ файл не найден, пробуем восстановить из резервной копии")
-        current_faq = None
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error("Ошибка при загрузке FAQ файла: %s, пробуем восстановить из резервной копии", e)
-        # Пробуем исправить JSON (убрать лишние запятые в конце)
-        try:
-            with open(FAQ_PATH, "r", encoding="utf-8") as f:
-                content = f.read()
-            # Убираем лишние запятые перед закрывающими скобками
-            content = re.sub(r',\s*\]', ']', content)
-            content = re.sub(r',\s*\}', '}', content)
-            current_faq = json.loads(content)
-            if isinstance(current_faq, list) and len(current_faq) > 0:
-                original_faq_count = len(current_faq)
-                logger.info("✅ FAQ исправлен автоматически: %d записей", original_faq_count)
-                # Сохраняем исправленный FAQ
-                with open(FAQ_PATH, "w", encoding="utf-8") as f:
-                    json.dump(current_faq, f, ensure_ascii=False, indent=2)
-            else:
-                current_faq = None
-        except Exception as fix_e:
-            logger.warning("Не удалось автоматически исправить FAQ: %s", fix_e)
-            current_faq = None
-    except Exception as e:
-        logger.exception("Неожиданная ошибка при загрузке FAQ: %s", e)
-        current_faq = None
-    
-    # Если не удалось загрузить FAQ, пробуем восстановить из резервной копии
-    if current_faq is None:
-        if os.path.exists(backup_path):
-            try:
-                logger.info("Восстанавливаю FAQ из резервной копии: %s", backup_path)
-                with open(backup_path, "r", encoding="utf-8") as f:
-                    current_faq = json.load(f)
-                if isinstance(current_faq, list):
-                    original_faq_count = len(current_faq)
-                    logger.info("✅ FAQ восстановлен из резервной копии: %d записей", original_faq_count)
-                    # Восстанавливаем основной файл из резервной копии
-                    shutil.copy2(backup_path, FAQ_PATH)
-                else:
-                    logger.error("Резервная копия FAQ не содержит список")
-                    current_faq = []
-            except Exception as restore_e:
-                logger.exception("Не удалось восстановить FAQ из резервной копии: %s", restore_e)
-                current_faq = []
-        else:
-            logger.warning("Резервная копия FAQ не найдена, создаем новый FAQ")
-            current_faq = []
-    
-    if not isinstance(current_faq, list):
-        logger.warning("FAQ данные не являются списком после всех попыток загрузки, возвращаем пустой список")
-        current_faq = []
-        original_faq_count = 0
-    
-    logger.debug("_load_faq_safe возвращает: %d записей (original_count: %d)", len(current_faq), original_faq_count)
-    return current_faq, original_faq_count
-
-
-def _save_faq_safe(faq_data: List[Dict[str, Any]], original_count: int) -> bool:
-    """
-    Безопасно сохраняет FAQ с проверкой целостности.
-    
-    Args:
-        faq_data: Список FAQ записей для сохранения
-        original_count: Оригинальное количество записей (для проверки)
-        
-    Returns:
-        True если сохранение успешно, False иначе
-    """
-    backup_path = f"{FAQ_PATH}.backup"
-    
-    # Проверяем, что количество записей увеличилось (или не изменилось, если это обновление)
-    if len(faq_data) < original_count:
-        logger.error("⚠️ КРИТИЧЕСКАЯ ОШИБКА: Количество записей уменьшилось! "
-                   "Было: %d, стало: %d", original_count, len(faq_data))
-        return False
-    
-    # Создаем резервную копию перед сохранением
-    try:
-        if os.path.exists(FAQ_PATH):
-            shutil.copy2(FAQ_PATH, backup_path)
-            logger.debug("Создана резервная копия FAQ: %s", backup_path)
-    except Exception as e:
-        logger.warning("Не удалось создать резервную копию FAQ: %s", e)
-    
-    # Сохраняем обновленный FAQ атомарно
-    try:
-        os.makedirs(os.path.dirname(FAQ_PATH), exist_ok=True)
-        # Используем временный файл для атомарной записи
-        temp_path = f"{FAQ_PATH}.tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(faq_data, f, ensure_ascii=False, indent=2)
-        # Атомарно заменяем файл
-        os.replace(temp_path, FAQ_PATH)
-        logger.info("✅ FAQ сохранен: %d записей (было: %d)", len(faq_data), original_count)
-        return True
-    except Exception as e:
-        logger.exception("Ошибка при сохранении FAQ: %s", e)
-        # Восстанавливаем из резервной копии
-        if os.path.exists(backup_path):
-            try:
-                shutil.copy2(backup_path, FAQ_PATH)
-                logger.info("Восстановлен FAQ из резервной копии после ошибки сохранения")
-            except Exception as restore_e:
-                logger.exception("Не удалось восстановить FAQ из резервной копии: %s", restore_e)
-        return False
-
-
-def _validate_faq_entry(question: str, answer: str) -> tuple[bool, str]:
-    """
-    Проверяет подходящесть FAQ записи.
-    
-    Args:
-        question: Вопрос
-        answer: Ответ
-        
-    Returns:
-        Кортеж (валидна ли запись, сообщение об ошибке)
-    """
-    question = question.strip() if question else ""
-    answer = answer.strip() if answer else ""
-    
-    if not question:
-        return False, "Вопрос не может быть пустым"
-    
-    if not answer:
-        return False, "Ответ не может быть пустым"
-    
-    # Минимальная длина вопроса (хотя бы 3 символа)
-    if len(question) < 3:
-        return False, "Вопрос слишком короткий (минимум 3 символа)"
-    
-    # Минимальная длина ответа (хотя бы 5 символов)
-    if len(answer) < 5:
-        return False, "Ответ слишком короткий (минимум 5 символов)"
-    
-    # Максимальная длина вопроса (не более 500 символов)
-    if len(question) > 500:
-        return False, "Вопрос слишком длинный (максимум 500 символов)"
-    
-    # Максимальная длина ответа (не более 2000 символов)
-    if len(answer) > 2000:
-        return False, "Ответ слишком длинный (максимум 2000 символов)"
-    
-    return True, ""
-
-
-def _add_faq_entry_safe(question: str, answer: str, source: str) -> tuple[bool, str]:
-    """
-    Безопасно добавляет одну запись в FAQ с проверкой уникальности и валидацией.
-    
-    Args:
-        question: Вопрос
-        answer: Ответ
-        source: Источник добавления ("admin", "manager", "user_like", "manager_like")
-        
-    Returns:
-        Кортеж (успешно ли добавлено, сообщение)
-    """
-    # Валидация записи
-    logger.debug("Валидация FAQ записи: вопрос='%s' (длина: %d), ответ='%s' (длина: %d), источник='%s'", 
-                 question[:50], len(question), answer[:50], len(answer), source)
-    is_valid, error_msg = _validate_faq_entry(question, answer)
-    if not is_valid:
-        logger.warning("FAQ запись не прошла валидацию: %s (вопрос: '%s', ответ: '%s')", 
-                       error_msg, question[:50], answer[:50])
-        return False, error_msg
-    
-    # Загружаем FAQ
-    logger.debug("Загрузка FAQ для добавления записи")
-    current_faq, original_count = _load_faq_safe()
-    logger.debug("Загружен FAQ: %d записей", len(current_faq))
-    
-    # Проверяем уникальность вопроса (case-insensitive)
-    question_lower = question.lower().strip()
-    existing_questions = {
-        item.get("question", "").lower().strip() 
-        for item in current_faq 
-        if item.get("question")
-    }
-    logger.debug("Проверка уникальности: вопрос='%s', существующих вопросов: %d", 
-                 question_lower[:50], len(existing_questions))
-    
-    if question_lower in existing_questions:
-        logger.info("Вопрос уже есть в FAQ, пропускаем добавление: '%s'", question[:50])
-        return False, "Вопрос уже существует в FAQ"
-    
-    # Добавляем новую запись
-    new_entry = {
-        "question": question.strip(),
-        "answer": answer.strip(),
-        "source": source
-    }
-    current_faq.append(new_entry)
-    
-    # Сохраняем с проверкой
-    if _save_faq_safe(current_faq, original_count):
-        logger.info("✅ FAQ запись добавлена: вопрос='%s', источник='%s', было: %d, стало: %d", 
-                   question[:50], source, original_count, len(current_faq))
-        return True, f"Запись успешно добавлена в FAQ (всего: {len(current_faq)} записей)"
-    else:
-        return False, "Ошибка при сохранении FAQ"
-
-
-def _add_faq_entries_batch(entries: List[Dict[str, str]], source: str) -> tuple[int, int, List[str]]:
-    """
-    Безопасно добавляет несколько записей в FAQ с проверкой уникальности и валидацией.
-    
-    Args:
-        entries: Список записей [{"question": str, "answer": str}, ...]
-        source: Источник добавления ("admin", "manager", "user_like", "manager_like")
-        
-    Returns:
-        Кортеж (количество добавленных, количество пропущенных, список ошибок)
-    """
-    if not entries:
-        return 0, 0, []
-    
-    # Загружаем FAQ один раз
-    current_faq, original_count = _load_faq_safe()
-    
-    # Собираем существующие вопросы
-    existing_questions = {
-        item.get("question", "").lower().strip() 
-        for item in current_faq 
-        if item.get("question")
-    }
-    
-    added_count = 0
-    skipped_count = 0
-    errors = []
-    
-    # Обрабатываем каждую запись
-    for entry in entries:
-        question = entry.get("question", "").strip()
-        answer = entry.get("answer", "").strip()
-        
-        # Валидация
-        is_valid, error_msg = _validate_faq_entry(question, answer)
-        if not is_valid:
-            skipped_count += 1
-            errors.append(f"'{question[:30]}...': {error_msg}")
-            continue
-        
-        # Проверка уникальности
-        question_lower = question.lower().strip()
-        if question_lower in existing_questions:
-            skipped_count += 1
-            logger.debug("Пропускаем дубликат вопроса: %s", question[:50])
-            continue
-        
-        # Добавляем запись
-        new_entry = {
-            "question": question,
-            "answer": answer,
-            "source": source
-        }
-        current_faq.append(new_entry)
-        existing_questions.add(question_lower)
-        added_count += 1
-    
-    # Сохраняем все добавленные записи одним разом
-    if added_count > 0:
-        if _save_faq_safe(current_faq, original_count):
-            logger.info("✅ Добавлено %d записей в FAQ (пропущено: %d), источник='%s', было: %d, стало: %d", 
-                       added_count, skipped_count, source, original_count, len(current_faq))
-        else:
-            return 0, len(entries), ["Ошибка при сохранении FAQ"]
-    
-    return added_count, skipped_count, errors
-
-
-def _parse_faq_text(text: str) -> List[Dict[str, str]]:
-    """
-    Парсит текст FAQ в список вопросов-ответов.
-    
-    Поддерживает форматы:
-    - Q: вопрос\nA: ответ
-    - JSON: [{"question": "...", "answer": "..."}]
-    
-    Args:
-        text: Текст для парсинга
-        
-    Returns:
-        Список словарей {"question": str, "answer": str}
-    """
-    faq_items = []
-    
-    # Пробуем парсить как JSON
-    try:
-        # Ищем JSON массив в тексте
-        json_match = re.search(r'\[.*\]', text, re.DOTALL)
-        if json_match:
-            parsed = json.loads(json_match.group(0))
-            if isinstance(parsed, list):
-                for item in parsed:
-                    if isinstance(item, dict) and "question" in item and "answer" in item:
-                        faq_items.append({
-                            "question": str(item["question"]).strip(),
-                            "answer": str(item["answer"]).strip()
-                        })
-                if faq_items:
-                    return faq_items
-    except (json.JSONDecodeError, ValueError):
-        pass
-    
-    # Парсим формат Q: ... A: ...
-    qa_pattern = re.compile(r'(?:Q|Вопрос)[:\s]+(.+?)(?:\n|$)(?:A|Ответ)[:\s]+(.+?)(?=\n(?:Q|Вопрос)|$)', re.IGNORECASE | re.DOTALL)
-    matches = qa_pattern.findall(text)
-    
-    for question, answer in matches:
-        question = question.strip()
-        answer = answer.strip()
-        if question and answer:
-            faq_items.append({"question": question, "answer": answer})
-    
-    # Если не нашли по паттерну, пробуем разделить по строкам
-    if not faq_items:
-        lines = text.split('\n')
-        current_question = None
-        current_answer = []
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                if current_question and current_answer:
-                    faq_items.append({
-                        "question": current_question,
-                        "answer": "\n".join(current_answer).strip()
-                    })
-                    current_question = None
-                    current_answer = []
-                continue
-            
-            # Проверяем, начинается ли строка с Q: или Вопрос:
-            if re.match(r'^(?:Q|Вопрос)[:\s]+', line, re.IGNORECASE):
-                if current_question and current_answer:
-                    faq_items.append({
-                        "question": current_question,
-                        "answer": "\n".join(current_answer).strip()
-                    })
-                current_question = re.sub(r'^(?:Q|Вопрос)[:\s]+', '', line, flags=re.IGNORECASE).strip()
-                current_answer = []
-            # Проверяем, начинается ли строка с A: или Ответ:
-            elif re.match(r'^(?:A|Ответ)[:\s]+', line, re.IGNORECASE):
-                answer_text = re.sub(r'^(?:A|Ответ)[:\s]+', '', line, flags=re.IGNORECASE).strip()
-                if current_question:
-                    current_answer.append(answer_text)
-                else:
-                    # Если нет вопроса, создаем пустой вопрос
-                    current_question = ""
-                    current_answer.append(answer_text)
-            elif current_question is not None:
-                # Продолжение ответа
-                current_answer.append(line)
-            else:
-                # Если нет вопроса, это может быть первый вопрос
-                current_question = line
-        
-        # Добавляем последний вопрос-ответ
-        if current_question and current_answer:
-            faq_items.append({
-                "question": current_question,
-                "answer": "\n".join(current_answer).strip()
-            })
-    
-    return faq_items
+# Функции _load_faq_safe, _save_faq_safe, _validate_faq_entry, _add_faq_entry_safe,
+# _add_faq_entries_batch, _parse_faq_text удалены - теперь используются из utils.faq_utils
 
 
 # Обработчик для добавления FAQ текстом (нарастающим итогом)
@@ -2005,7 +1580,7 @@ async def handle_faq_text(message: Message, state: FSMContext) -> None:
             # Если LLM не вернул результат, пробуем прямой парсинг для формата Q: ... A: ...
             if not new_faq:
                 logger.info("LLM не вернул результат, пробуем прямой парсинг для формата Q: ... A: ...")
-                parsed_faq = _parse_faq_text(new_text)
+                parsed_faq = parse_faq_text(new_text)
                 
                 if parsed_faq:
                     # Добавляем source для всех записей
@@ -2034,7 +1609,7 @@ async def handle_faq_text(message: Message, state: FSMContext) -> None:
             return
         
         # Используем единую функцию добавления FAQ с проверкой уникальности и валидацией
-        added_count, skipped_count, errors = _add_faq_entries_batch(new_faq, "admin")
+        added_count, skipped_count, errors = add_faq_entries_batch(new_faq, "admin")
         
         if not added_count:
             await message.answer(
@@ -2440,7 +2015,6 @@ async def handle_user_message(message: Message) -> None:
             "None" if answer is None else f"length={len(answer)}",
             _meta
         )
-        
     except Exception as e:
         logger.exception("Ошибка при генерации ответа: %s", e)
         answer = None
@@ -2472,24 +2046,9 @@ async def handle_user_message(message: Message) -> None:
         
         # Сохраняем ответ в историю ТОЛЬКО после успешной отправки
         try:
-            from responder import _load_json, _save_json, CHAT_HISTORY_PATH
-            chat_history = _load_json(CHAT_HISTORY_PATH, {})
-            dialog_history = chat_history.get(dialog_id, [])
-            
-            # Добавляем ответ ассистента в историю с временной меткой
-            dialog_history.append({
-                "role": "assistant",
-                "content": answer,
-                "timestamp": datetime.now().isoformat()
-            })
-            # Сохраняем всю историю (без ограничений)
-            chat_history[dialog_id] = dialog_history
-            _save_json(CHAT_HISTORY_PATH, chat_history)
-            
-            logger.info(
-                "Saved chat history for dialog_id=%s: %d messages (after successful send)",
-                dialog_id, len(chat_history[dialog_id])
-            )
+            usage = _meta.get("usage") if _meta and "usage" in _meta else None
+            save_assistant_message(dialog_id, answer, usage)
+            logger.info("Saved chat history for dialog_id=%s (after successful send)", dialog_id)
         except Exception as e:
             logger.warning("Failed to save chat history after sending to Telegram: %s", e)
     except Exception as e:
@@ -2529,80 +2088,8 @@ async def handle_rating(callback: CallbackQuery) -> None:
             return
 
         if action == "rate_up":
-            # Загружаем существующий FAQ
-            original_faq_count = 0
-            backup_path = f"{FAQ_PATH}.backup"
-            
-            try:
-                with open(FAQ_PATH, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                    if not content:
-                        logger.warning("FAQ файл пуст, пробуем восстановить из резервной копии")
-                        raise ValueError("FAQ файл пуст")
-                    faq_data = json.loads(content)
-                # Проверяем, что это список
-                if not isinstance(faq_data, list):
-                    logger.error("FAQ файл не содержит список, пробуем восстановить из резервной копии")
-                    raise ValueError("FAQ файл не содержит список")
-                else:
-                    original_faq_count = len(faq_data)
-                    if original_faq_count == 0:
-                        logger.warning("FAQ файл содержит пустой список, пробуем восстановить из резервной копии")
-                        raise ValueError("FAQ файл содержит пустой список")
-                logger.info("Загружен FAQ: %d записей", original_faq_count)
-            except FileNotFoundError:
-                logger.warning("FAQ файл не найден, пробуем восстановить из резервной копии")
-                faq_data = None
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.error("Ошибка при загрузке FAQ файла: %s, пробуем восстановить из резервной копии", e)
-                # Пробуем исправить JSON (убрать лишние запятые в конце)
-                try:
-                    with open(FAQ_PATH, "r", encoding="utf-8") as f:
-                        content = f.read()
-                    # Убираем лишние запятые перед закрывающими скобками
-                    content = re.sub(r',\s*\]', ']', content)
-                    content = re.sub(r',\s*\}', '}', content)
-                    faq_data = json.loads(content)
-                    if isinstance(faq_data, list) and len(faq_data) > 0:
-                        original_faq_count = len(faq_data)
-                        logger.info("✅ FAQ исправлен автоматически: %d записей", original_faq_count)
-                        # Сохраняем исправленный FAQ
-                        with open(FAQ_PATH, "w", encoding="utf-8") as f:
-                            json.dump(faq_data, f, ensure_ascii=False, indent=2)
-                    else:
-                        faq_data = None
-                except Exception as fix_e:
-                    logger.warning("Не удалось автоматически исправить FAQ: %s", fix_e)
-                    faq_data = None
-            except Exception as e:
-                logger.exception("Неожиданная ошибка при загрузке FAQ: %s", e)
-                faq_data = None
-            
-            # Если не удалось загрузить FAQ, пробуем восстановить из резервной копии
-            if faq_data is None:
-                if os.path.exists(backup_path):
-                    try:
-                        logger.info("Восстанавливаю FAQ из резервной копии: %s", backup_path)
-                        with open(backup_path, "r", encoding="utf-8") as f:
-                            faq_data = json.load(f)
-                        if isinstance(faq_data, list):
-                            original_faq_count = len(faq_data)
-                            logger.info("✅ FAQ восстановлен из резервной копии: %d записей", original_faq_count)
-                            # Восстанавливаем основной файл из резервной копии
-                            shutil.copy2(backup_path, FAQ_PATH)
-                        else:
-                            logger.error("Резервная копия FAQ не содержит список")
-                            faq_data = []
-                    except Exception as restore_e:
-                        logger.exception("Не удалось восстановить FAQ из резервной копии: %s", restore_e)
-                        faq_data = []
-                else:
-                    logger.warning("Резервная копия FAQ не найдена, создаем новый FAQ")
-                    faq_data = []
-            
-            # Проверяем, нет ли уже такого вопроса (сравниваем по нижнему регистру)
+            # Проверяем, нет ли уже такого вопроса
             question = qa_data.get("question", "").strip()
-            question_lower = question.lower() if question else ""
             
             if not question:
                 logger.warning("Пустой вопрос в qa_data, пропускаем добавление")
@@ -2610,15 +2097,15 @@ async def handle_rating(callback: CallbackQuery) -> None:
                 return
             
             # Используем единую функцию добавления FAQ с проверкой уникальности и валидацией
-            success, message = _add_faq_entry_safe(question, qa_data.get("answer", "").strip(), "user_like")
+            success, msg = add_faq_entry_safe(question, qa_data.get("answer", "").strip(), "user_like")
             
             if success:
                 await callback.answer("Ответ добавлен в базу знаний.")
             else:
-                if "уже существует" in message.lower() or "уже есть" in message.lower():
+                if "уже существует" in msg.lower() or "уже есть" in msg.lower():
                     await callback.answer("Такой вопрос уже есть в базе знаний.")
                 else:
-                    logger.debug("Не удалось добавить FAQ через лайк: %s", message)
+                    logger.debug("Не удалось добавить FAQ через лайк: %s", msg)
                     await callback.answer("Не удалось добавить в базу знаний.")
         else:  # rate_down
             await callback.answer("Спасибо, передадим менеджеру.")
