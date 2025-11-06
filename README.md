@@ -222,6 +222,65 @@ python manage.py send-image <chat_id> <file_path>
 - `requests==2.32.3` - HTTP клиент для Avito API
 - `python-dotenv==1.0.1` - Загрузка переменных окружения
 
+## Развертывание на VDS
+
+Подробные инструкции по развертыванию на сервере и настройке автоматического деплоя через GitHub Actions:
+
+- **[INSTALL.md](INSTALL.md)** - Автоматическая установка (одна команда) ⭐
+- **[QUICK_START_DEPLOY.md](QUICK_START_DEPLOY.md)** - Быстрый старт развертывания
+- **[DEPLOYMENT.md](DEPLOYMENT.md)** - Полная инструкция по развертыванию на VDS
+- **[WEBHOOK_SETUP.md](WEBHOOK_SETUP.md)** - Настройка webhook (nginx) на VDS
+- **[GITHUB_ACTIONS_SETUP.md](GITHUB_ACTIONS_SETUP.md)** - Настройка GitHub Actions для автоматического деплоя
+
+### Быстрый старт развертывания
+
+#### Вариант 1: Полностью автоматическая установка (рекомендуется)
+
+```bash
+# Подключитесь к серверу
+ssh root@your-server-ip
+
+# Скачайте и запустите скрипт автоматической установки
+curl -O https://raw.githubusercontent.com/Kustov-Daniil/avito_autoanswer_bot/main/auto_install.sh
+chmod +x auto_install.sh
+./auto_install.sh
+```
+
+Скрипт автоматически:
+- ✅ Установит все зависимости (Python, nginx, certbot и т.д.)
+- ✅ Клонирует проект с GitHub
+- ✅ Настроит виртуальное окружение
+- ✅ Создаст шаблон `.env` файла
+- ✅ Настроит systemd сервис
+- ✅ Настроит nginx и webhook
+- ✅ Настроит firewall
+- ✅ Запустит сервис
+
+**После установки:**
+1. Создайте или скопируйте `.env` файл в `/home/avito_autoanswer_bot/.env`
+2. Заполните все переменные (токены, ключи, ID)
+3. Перезапустите сервис: `systemctl restart avito_autoanswer_bot.service`
+4. Подпишитесь на webhook: `/subscribe` (через Telegram бота)
+
+#### Вариант 2: Ручная установка
+
+```bash
+ssh root@your-server-ip
+cd /home
+git clone https://github.com/Kustov-Daniil/avito_autoanswer_bot.git avito_autoanswer_bot
+cd avito_autoanswer_bot
+chmod +x deploy.sh
+./deploy.sh
+chmod +x setup_webhook.sh
+./setup_webhook.sh
+```
+
+#### Настройка GitHub Actions
+
+После установки настройте GitHub Actions для автоматического деплоя (см. [GITHUB_ACTIONS_SETUP.md](GITHUB_ACTIONS_SETUP.md))
+
+После настройки каждый push в ветку `main` будет автоматически деплоить изменения на сервер.
+
 ## Разработка
 
 ### Структура кода

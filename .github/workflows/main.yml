@@ -4,6 +4,7 @@ on:
   push:
     branches: 
       - main
+  workflow_dispatch:  # Позволяет запускать вручную
 
 jobs:
   deploy:
@@ -11,17 +12,46 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v2
-
-    - name: Start SSH Agent
-      run: eval "$(ssh-agent -s)"
+      uses: actions/checkout@v4
 
     - name: Setup SSH
-      uses: webfactory/ssh-agent@v0.5.3
+      uses: webfactory/ssh-agent@v0.9.0
       with:
         ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
+    - name: Add server to known hosts
+      run: |
+        ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts || true
+
     - name: Deploy to Server
       run: |
-        rsync -avz -e "ssh -o StrictHostKeyChecking=no" ./ root@93.183.91.110:/home/avito_autoanswer_bot/
-        ssh -o StrictHostKeyChecking=no root@93.183.91.110 "sudo systemctl restart avito_autoanswer_bot.service"
+        # Исключаем ненужные файлы при синхронизации
+        rsync -avz --delete \
+          --exclude='.git' \
+          --exclude='.github' \
+          --exclude='__pycache__' \
+          --exclude='*.pyc' \
+          --exclude='.env' \
+          --exclude='venv' \
+          --exclude='data/logs/*.log' \
+          -e "ssh -o StrictHostKeyChecking=no" \
+          ./ root@${{ secrets.SERVER_HOST }}:/home/avito_autoanswer_bot/
+        
+        # Обновляем зависимости на сервере
+        ssh -o StrictHostKeyChecking=no root@${{ secrets.SERVER_HOST }} << 'EOF'
+          cd /home/avito_autoanswer_bot
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          
+          # Перезагружаем nginx конфигурацию (если nginx установлен)
+          if systemctl is-active --quiet nginx; then
+            nginx -t && systemctl reload nginx || true
+          fi
+        EOF
+        
+        # Перезапускаем сервис
+        ssh -o StrictHostKeyChecking=no root@${{ secrets.SERVER_HOST }} "systemctl restart avito_autoanswer_bot.service"
+        
+        # Проверяем статус сервиса
+        ssh -o StrictHostKeyChecking=no root@${{ secrets.SERVER_HOST }} "systemctl status avito_autoanswer_bot.service --no-pager"
