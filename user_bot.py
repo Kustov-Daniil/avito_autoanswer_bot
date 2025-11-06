@@ -100,9 +100,7 @@ async def cmd_start(message: Message) -> None:
     """
     async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
         text = (
-            "Привет! Я визовый помощник.\n"
-            "Помогу с документами, визами и подачей заявлений.\n"
-            "Задай вопрос — я постараюсь ответить максимально точно."
+            "Привет! Я цифровой помощник компании VisaWay!"
         )
         await message.answer(text)
         logger.info("/start вызван пользователем %d", message.from_user.id)
@@ -317,11 +315,21 @@ async def handle_faq_file(message: Message, state: FSMContext) -> None:
 Отвечай только JSON — без текста, без комментариев.
 """
         try:
-            response = await client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=TEMPERATURE,
-            )
+            # Проверяем, поддерживает ли модель temperature
+            # Для gpt-5-mini и некоторых других моделей temperature не поддерживается
+            use_temperature = LLM_MODEL not in ["gpt-5-mini", "gpt-5"]
+            
+            if use_temperature:
+                response = await client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=TEMPERATURE,
+                )
+            else:
+                response = await client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                )
             llm_response = response.choices[0].message.content.strip()
             
             # Извлекаем JSON из ответа
@@ -419,6 +427,11 @@ async def handle_user_message(message: Message) -> None:
     embedded_history = hist_m.group(1).strip() if hist_m else ""
     
     # Генерируем ответ через единый модуль
+    logger.info(
+        "Calling generate_reply for dialog_id=%s, user_question_length=%d",
+        dialog_id, len(user_question)
+    )
+    
     try:
         answer, _meta = await generate_reply(
             dialog_id=dialog_id,
@@ -426,9 +439,25 @@ async def handle_user_message(message: Message) -> None:
             user_name=user_name,
             embedded_history=embedded_history,
         )
+        
+        logger.info(
+            "generate_reply returned for dialog_id=%s: answer=%s, meta=%s",
+            dialog_id,
+            "None" if answer is None else f"length={len(answer)}",
+            _meta
+        )
+        
     except Exception as e:
         logger.exception("Ошибка при генерации ответа: %s", e)
-        answer = "Произошла ошибка при генерации ответа. Попробуйте позже."
+        answer = None
+    
+    # Если произошла ошибка при генерации ответа - не отправляем ничего клиенту
+    if answer is None:
+        logger.warning("Failed to generate reply for dialog_id=%s - not sending message to client", dialog_id)
+        await message.answer("Извините, произошла техническая ошибка. Попробуйте позже или обратитесь к менеджеру.")
+        return
+    
+    logger.info("Sending answer to Telegram user for dialog_id=%s, answer_length=%d", dialog_id, len(answer))
     
     # Создаем кнопки для рейтинга
     qa_id = f"{int(time.time() * 1000)}{random.randint(1000, 9999)}"

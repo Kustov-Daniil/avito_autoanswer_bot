@@ -223,12 +223,16 @@ def send_text_message(chat_id: str, text: str) -> bool:
         True если успешно, False при ошибке
     """
     # Валидация входных данных
+    logger.info("send_text_message: Starting validation - chat_id=%s, text_length=%d", chat_id, len(text) if text else 0)
+    
     if not chat_id or len(chat_id) < MIN_CHAT_ID_LENGTH:
-        logger.error("send_text_message: invalid chat_id (chat_id=%s)", chat_id)
+        logger.error("send_text_message: invalid chat_id (chat_id=%s, length=%d, min=%d)", 
+                     chat_id, len(chat_id) if chat_id else 0, MIN_CHAT_ID_LENGTH)
         return False
     
     if not text or len(text.strip()) < MIN_TEXT_LENGTH:
-        logger.error("send_text_message: invalid text (text_length=%d)", len(text) if text else 0)
+        logger.error("send_text_message: invalid text (text_length=%d, min=%d)", 
+                     len(text) if text else 0, MIN_TEXT_LENGTH)
         return False
     
     if not AVITO_ACCOUNT_ID:
@@ -236,12 +240,15 @@ def send_text_message(chat_id: str, text: str) -> bool:
         return False
     
     if not _validate_account_id(AVITO_ACCOUNT_ID):
-        logger.error("send_text_message: invalid AVITO_ACCOUNT_ID format")
+        logger.error("send_text_message: invalid AVITO_ACCOUNT_ID format (account_id=%s)", AVITO_ACCOUNT_ID)
         return False
     
     if not AVITO_CLIENT_ID or not AVITO_CLIENT_SECRET:
-        logger.error("send_text_message: AVITO_CLIENT_ID or AVITO_CLIENT_SECRET not set")
+        logger.error("send_text_message: AVITO_CLIENT_ID or AVITO_CLIENT_SECRET not set (client_id=%s, secret=%s)", 
+                     "set" if AVITO_CLIENT_ID else "not set", "set" if AVITO_CLIENT_SECRET else "not set")
         return False
+    
+    logger.info("send_text_message: Validation passed - proceeding to send")
     
     # Проверяем существование чата перед отправкой (опционально, для диагностики)
     try:

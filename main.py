@@ -9,6 +9,7 @@ import threading
 import logging
 import re
 import json
+import os
 from datetime import datetime
 from typing import Dict, Any, Optional, Callable, Awaitable, List
 from flask import Flask, request, jsonify, Response
@@ -21,7 +22,7 @@ from aiogram.client.default import DefaultBotProperties
 from config import (
     TELEGRAM_MANAGER_ID, TELEGRAM_BOT_TOKEN,
     AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_ACCOUNT_ID,
-    SIGNAL_PHRASES
+    SIGNAL_PHRASES, DATA_DIR
 )
 from avito_api import send_message, list_messages_v3
 from avito_sessions import can_bot_reply, set_waiting_manager, set_cooldown_after_manager
@@ -29,8 +30,39 @@ from responder import generate_reply
 from user_bot import user_router
 from telegram_utils import safe_send_message, safe_send_message_to_chat
 
-logging.basicConfig(level=logging.INFO)
+# Настройка логирования: вывод в файл и в консоль
+LOG_DIR = os.path.join(DATA_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_FILE = os.path.join(LOG_DIR, "bot.log")
+
+# Формат логов
+log_format = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# Настройка root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Очистка существующих обработчиков
+root_logger.handlers.clear()
+
+# Обработчик для файла
+file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(log_format)
+root_logger.addHandler(file_handler)
+
+# Обработчик для консоли
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(log_format)
+root_logger.addHandler(console_handler)
+
 logger = logging.getLogger(__name__)
+logger.info("Logging initialized. Log file: %s", LOG_FILE)
 
 # Константы для webhook обработки
 WEBHOOK_ENDPOINT: str = "/avito/webhook"
@@ -129,6 +161,86 @@ def run_async_in_thread(coro: Awaitable[Any]) -> None:
     
     thread = threading.Thread(target=run_in_thread, daemon=True)
     thread.start()
+
+
+async def _notify_manager_for_chat(
+    chat_id: str,
+    text: str,
+    data: Dict[str, Any],
+    thread_bot: Bot
+) -> None:
+    """
+    Уведомляет менеджера в Telegram о сообщении из Avito.
+    
+    Args:
+        chat_id: ID чата в Avito
+        text: Текст сообщения от клиента
+        data: Данные webhook от Avito
+        thread_bot: Экземпляр бота для отправки сообщений
+    """
+    logger.info("Notifying manager for chat %s", chat_id)
+    
+    # Получаем информацию о чате и историю сообщений из Avito
+    chat_info: Optional[Dict[str, Any]] = None
+    history: List[Dict[str, Any]] = []
+    user_name: Optional[str] = None
+    
+    try:
+        # Получаем информацию о чате (объявление, аккаунт, собеседник, локация)
+        from avito_api import get_chat
+        chat_info = get_chat(chat_id)
+        if chat_info:
+            logger.info("Retrieved chat info for chat %s: %s", chat_id, json.dumps(chat_info, indent=2, ensure_ascii=False)[:500])
+            # Извлекаем имя пользователя из chat_info
+            user_data = chat_info.get("user") or chat_info.get("interlocutor") or chat_info.get("interlocutor_info") or {}
+            if isinstance(user_data, dict):
+                user_name = (
+                    user_data.get("name") or
+                    user_data.get("first_name") or
+                    user_data.get("full_name") or
+                    user_data.get("profile_name") or
+                    user_data.get("username")
+                )
+        else:
+            logger.warning("get_chat returned None or empty for chat %s", chat_id)
+    except Exception as e:
+        logger.warning("Failed to fetch chat info for chat %s: %s", chat_id, e)
+        logger.exception("Full exception details:")
+    
+    try:
+        logger.info("Fetching message history for chat %s", chat_id)
+        history = list_messages_v3(chat_id, limit=50, offset=0)
+        logger.info("Retrieved %d messages from history for chat %s", len(history), chat_id)
+        if history:
+            logger.debug("First message sample: %s", json.dumps(history[0] if history else {}, indent=2, ensure_ascii=False)[:300])
+    except Exception as e:
+        logger.warning("Failed to fetch message history for chat %s: %s", chat_id, e)
+        logger.exception("Full exception details:")
+        # Продолжаем без истории, если не удалось получить
+    
+    # Извлекаем имя пользователя из webhook, если не получили из chat_info
+    if not user_name:
+        webhook_payload_value = (data.get("payload") or {}).get("value") or {}
+        user_data = webhook_payload_value.get("user") or webhook_payload_value.get("interlocutor") or {}
+        if isinstance(user_data, dict):
+            user_name = (
+                user_data.get("name") or
+                user_data.get("first_name") or
+                user_data.get("full_name")
+            )
+    
+    # Формируем уведомление с историей
+    notification_text = format_manager_text_with_history(
+        chat_id, text, history, chat_info=chat_info, user_name=user_name
+    )
+    
+    # Отправляем уведомление менеджеру
+    await safe_send_message_to_chat(
+        thread_bot,
+        TELEGRAM_MANAGER_ID,
+        notification_text
+    )
+    logger.info("Sent notification to manager for chat %s", chat_id)
 
 
 def format_manager_text_with_history(
@@ -643,109 +755,167 @@ def avito_webhook() -> Response:
                 logger.info("Ignoring message with only whitespace/special chars for chat %s", chat_id)
                 return
 
-            # Если бот должен молчать — выходим
+            # Если бот должен молчать — уведомляем менеджера о ВСЕХ сообщениях
             if not can_bot_reply(chat_id):
-                logger.info("Bot is paused for chat %s (waiting_manager or cooldown)", chat_id)
+                logger.info("Bot is paused for chat %s (waiting_manager or cooldown) - notifying manager", chat_id)
+                # Уведомляем менеджера о ВСЕХ сообщениях, когда бот на паузе
+                await _notify_manager_for_chat(chat_id, text, data, thread_bot)
                 return
 
             # Проверяем конфигурацию перед отправкой
             if not AVITO_ACCOUNT_ID:
                 logger.error("AVITO_ACCOUNT_ID not set! Cannot send message to Avito chat %s", chat_id)
+                # Уведомляем менеджера, если нет конфигурации
+                await _notify_manager_for_chat(chat_id, text, data, thread_bot)
                 return
 
             # Генерируем автоответ ЕДИНЫМ модулем и отправляем в Avito
             logger.info("Generating auto-reply for chat %s, text_length=%d", chat_id, len(text))
-            answer, meta = await generate_reply(dialog_id=f"avito_{chat_id}", incoming_text=text)
-            logger.info("Generated reply for chat %s, answer_length=%d", chat_id, len(answer))
             
-            logger.info(
-                "Attempting to send message to Avito: account_id=%s, chat_id=%s",
-                AVITO_ACCOUNT_ID, chat_id
-            )
-            ok = send_message(chat_id, answer)
-            if ok:
-                logger.info("✅ Auto-reply sent successfully to Avito chat %s", chat_id)
-            else:
-                logger.error(
-                    "❌ Failed to send auto-reply to Avito chat %s - check logs above for details",
-                    chat_id
+            try:
+                answer, meta = await generate_reply(dialog_id=f"avito_{chat_id}", incoming_text=text)
+                logger.info(
+                    "generate_reply returned for chat %s: answer=%s, meta=%s",
+                    chat_id,
+                    "None" if answer is None else f"length={len(answer)}",
+                    meta
                 )
+            except Exception as e:
+                logger.exception("Exception in generate_reply for chat %s: %s", chat_id, e)
+                answer = None
+                meta = {"contains_signal_phrase": True}
+            
+            # Инициализируем флаг для перевода на менеджера
+            contains_signal = False
+            
+            # Если произошла ошибка при генерации ответа - переводим на менеджера
+            if answer is None:
+                logger.warning("Failed to generate reply for chat %s - transferring to manager", chat_id)
+                # Переводим на менеджера при ошибке генерации
+                contains_signal = True
+                if meta is None:
+                    meta = {}
+                meta["contains_signal_phrase"] = True
+            else:
+                logger.info("Generated reply for chat %s, answer_length=%d", chat_id, len(answer))
+                
+                # Avito API ограничение: текст не должен превышать ~1000 символов (лучше 950)
+                MAX_AVITO_MESSAGE_LENGTH = 950
+                if len(answer) > MAX_AVITO_MESSAGE_LENGTH:
+                    logger.warning(
+                        "Answer too long (%d chars), truncating to %d chars for Avito",
+                        len(answer), MAX_AVITO_MESSAGE_LENGTH
+                    )
+                    # Обрезаем до 950 символов, стараясь не обрезать слово посередине
+                    truncated = answer[:MAX_AVITO_MESSAGE_LENGTH]
+                    # Пытаемся найти последний пробел, чтобы не обрезать слово
+                    last_space = truncated.rfind(' ')
+                    if last_space > MAX_AVITO_MESSAGE_LENGTH - 50:  # Если пробел не слишком далеко
+                        truncated = truncated[:last_space]
+                    answer = truncated + "..."
+                    logger.info("Answer truncated to %d chars", len(answer))
+                
+                logger.info(
+                    "Attempting to send message to Avito: account_id=%s, chat_id=%s, answer_length=%d",
+                    AVITO_ACCOUNT_ID, chat_id, len(answer)
+                )
+                
+                logger.info(
+                    "About to call send_message: chat_id=%s, answer_length=%d, account_id=%s",
+                    chat_id, len(answer), AVITO_ACCOUNT_ID
+                )
+                
+                try:
+                    ok = send_message(chat_id, answer)
+                    logger.info(
+                        "send_message returned for chat %s: ok=%s",
+                        chat_id, ok
+                    )
+                    
+                    if not ok:
+                        logger.error(
+                            "❌ send_message returned False for chat %s - check avito_api logs for details",
+                            chat_id
+                        )
+                        logger.error(
+                            "Failed to send: chat_id=%s, answer_length=%d, account_id=%s",
+                            chat_id, len(answer), AVITO_ACCOUNT_ID
+                        )
+                except Exception as e:
+                    logger.exception("Exception in send_message for chat %s: %s", chat_id, e)
+                    ok = False
+                
+                if ok:
+                    logger.info("✅ Auto-reply sent successfully to Avito chat %s", chat_id)
+                    
+                    # Сохраняем ответ в историю ТОЛЬКО после успешной отправки
+                    try:
+                        from responder import _load_json, _save_json, CHAT_HISTORY_PATH
+                        chat_history = _load_json(CHAT_HISTORY_PATH, {})
+                        dialog_id = f"avito_{chat_id}"
+                        dialog_history = chat_history.get(dialog_id, [])
+                        
+                        # Добавляем ответ ассистента в историю
+                        dialog_history.append({"role": "assistant", "content": answer})
+                        # Ограничиваем историю последними 6 сообщениями перед сохранением (MAX_HISTORY_MESSAGES = 6)
+                        chat_history[dialog_id] = dialog_history[-6:]
+                        _save_json(CHAT_HISTORY_PATH, chat_history)
+                        
+                        logger.info(
+                            "Saved chat history for dialog_id=%s: %d messages (after successful send)",
+                            dialog_id, len(chat_history[dialog_id])
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to save chat history after sending: %s", e)
+                    
+                    # Проверяем, содержит ли сообщение клиента сигнальные фразы
+                    text_lower = text.strip().lower()
+                    contains_signal_in_text = any(phrase.lower() in text_lower for phrase in SIGNAL_PHRASES)
+                    
+                    # Если в meta["contains_signal_phrase"] был True, значит в исходном ответе от LLM
+                    # была сигнальная фраза (которая была заменена на "Подождите, пожалуйста...").
+                    # В этом случае менеджер должен быть уведомлен, даже если ответ успешно отправлен,
+                    # потому что клиент получил сообщение о том, что менеджер ответит
+                    contains_signal = contains_signal_in_text or meta.get("contains_signal_phrase", False)
+                    
+                    logger.info(
+                        "After successful send: contains_signal_in_text=%s, meta.contains_signal_phrase=%s, contains_signal=%s",
+                        contains_signal_in_text, meta.get("contains_signal_phrase"), contains_signal
+                    )
+                else:
+                    logger.error(
+                        "❌ Failed to send auto-reply to Avito chat %s - transferring to manager",
+                        chat_id
+                    )
+                    logger.error(
+                        "Details: chat_id=%s, answer_length=%d, account_id=%s",
+                        chat_id, len(answer), AVITO_ACCOUNT_ID
+                    )
+                    logger.error(
+                        "Please check avito_api.py logs above for detailed error information"
+                    )
+                    logger.error(
+                        "Answer was NOT saved to history because send failed"
+                    )
+                    # При ошибке отправки переводим на менеджера
+                    contains_signal = True
+                    if meta is None:
+                        meta = {}
+                    meta["contains_signal_phrase"] = True
+                    
+                    logger.info(
+                        "After failed send: contains_signal=%s, meta.contains_signal_phrase=%s",
+                        contains_signal, meta.get("contains_signal_phrase")
+                    )
             
             # Если бот сообщил, что ответит менеджер — включаем бесконечную паузу
             if meta.get("contains_signal_phrase"):
                 set_waiting_manager(chat_id)
             
-            # Проверяем, содержит ли сообщение клиента или ответ бота сигнальные фразы
-            text_lower = text.strip().lower()
-            answer_lower = answer.lower()
-            contains_signal = any(phrase.lower() in text_lower for phrase in SIGNAL_PHRASES) or \
-                            any(phrase.lower() in answer_lower for phrase in SIGNAL_PHRASES)
-            
-            # Уведомляем менеджера ТОЛЬКО если есть сигнальная фраза
+            # Уведомляем менеджера если есть сигнальная фраза или произошла ошибка
             if contains_signal or meta.get("contains_signal_phrase"):
                 logger.info("Signal phrase detected in message or reply for chat %s", chat_id)
-                
-                # Получаем информацию о чате и историю сообщений из Avito
-                chat_info: Optional[Dict[str, Any]] = None
-                history: List[Dict[str, Any]] = []
-                user_name: Optional[str] = None
-                
-                try:
-                    # Получаем информацию о чате (объявление, аккаунт, собеседник, локация)
-                    from avito_api import get_chat
-                    chat_info = get_chat(chat_id)
-                    if chat_info:
-                        logger.info("Retrieved chat info for chat %s: %s", chat_id, json.dumps(chat_info, indent=2, ensure_ascii=False)[:500])
-                        # Извлекаем имя пользователя из chat_info
-                        user_data = chat_info.get("user") or chat_info.get("interlocutor") or chat_info.get("interlocutor_info") or {}
-                        if isinstance(user_data, dict):
-                            user_name = (
-                                user_data.get("name") or
-                                user_data.get("first_name") or
-                                user_data.get("full_name") or
-                                user_data.get("profile_name") or
-                                user_data.get("username")
-                            )
-                    else:
-                        logger.warning("get_chat returned None or empty for chat %s", chat_id)
-                except Exception as e:
-                    logger.warning("Failed to fetch chat info for chat %s: %s", chat_id, e)
-                    logger.exception("Full exception details:")
-                
-                try:
-                    logger.info("Fetching message history for chat %s", chat_id)
-                    history = list_messages_v3(chat_id, limit=50, offset=0)
-                    logger.info("Retrieved %d messages from history for chat %s", len(history), chat_id)
-                    if history:
-                        logger.debug("First message sample: %s", json.dumps(history[0] if history else {}, indent=2, ensure_ascii=False)[:300])
-                except Exception as e:
-                    logger.warning("Failed to fetch message history for chat %s: %s", chat_id, e)
-                    logger.exception("Full exception details:")
-                    # Продолжаем без истории, если не удалось получить
-                
-                # Извлекаем имя пользователя из webhook, если не получили из chat_info
-                if not user_name:
-                    webhook_payload_value = (data.get("payload") or {}).get("value") or {}
-                    user_data = webhook_payload_value.get("user") or webhook_payload_value.get("interlocutor") or {}
-                    if isinstance(user_data, dict):
-                        user_name = (
-                            user_data.get("name") or
-                            user_data.get("first_name") or
-                            user_data.get("full_name")
-                        )
-                
-                # Формируем уведомление с историей
-                notification_text = format_manager_text_with_history(
-                    chat_id, text, history, chat_info=chat_info, user_name=user_name
-                )
-                
-                # Отправляем уведомление менеджеру
-                await safe_send_message_to_chat(
-                    thread_bot,
-                    TELEGRAM_MANAGER_ID,
-                    notification_text
-                )
-                logger.info("Sent notification to manager for chat %s (contains signal phrase)", chat_id)
+                await _notify_manager_for_chat(chat_id, text, data, thread_bot)
             else:
                 logger.info("No signal phrase detected, skipping manager notification for chat %s", chat_id)
         finally:
