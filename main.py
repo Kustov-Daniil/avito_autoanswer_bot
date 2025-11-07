@@ -1345,6 +1345,14 @@ def run_flask() -> None:
 
 async def run_bot() -> None:
     """Запускает Telegram бота через polling."""
+    # Устанавливаем меню бота при запуске
+    try:
+        from user_bot import setup_bot_menu
+        await setup_bot_menu()
+        logger.info("Меню бота установлено при запуске")
+    except Exception as e:
+        logger.warning("Не удалось установить меню бота при запуске: %s", e)
+    
     await dp.start_polling(bot)
 
 

@@ -1474,24 +1474,12 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 # ----------------------------
 # /setmenu — админ
 # ----------------------------
-@user_router.message(F.text.regexp(r"^/setmenu\b"))
-async def cmd_set_menu(message: Message, state: FSMContext) -> None:
+async def setup_bot_menu() -> None:
     """
-    Обрабатывает команду /setmenu для обновления меню бота.
-    
     Устанавливает команды бота в меню Telegram.
     
-    Args:
-        message: Сообщение с командой
-        state: FSM контекст для управления состоянием
+    Вызывается автоматически при запуске бота и может быть вызвана вручную через /setmenu.
     """
-    if not _check_admin(message.from_user.id):
-        await message.answer("⛔️ Недостаточно прав.")
-        return
-    
-    # Очищаем состояние, если было активно
-    await state.clear()
-    
     try:
         # Определяем команды для меню
         commands = [
@@ -1512,7 +1500,7 @@ async def cmd_set_menu(message: Message, state: FSMContext) -> None:
         
         # Устанавливаем команды для всех пользователей
         await bot.set_my_commands(commands)
-        logger.info("Меню бота обновлено пользователем %d", message.from_user.id)
+        logger.info("Меню бота установлено для всех пользователей")
         
         # Устанавливаем команды для администраторов (scope)
         if ADMINS:
@@ -1523,10 +1511,35 @@ async def cmd_set_menu(message: Message, state: FSMContext) -> None:
                         commands + admin_commands,
                         scope=BotCommandScopeChat(chat_id=admin_id)
                     )
-                    logger.info("Меню администратора %d обновлено", admin_id)
+                    logger.info("Меню администратора %d установлено", admin_id)
                 except Exception as e:
                     logger.warning("Не удалось установить меню для администратора %d: %s", admin_id, e)
         
+        logger.info("✅ Меню бота успешно установлено при запуске")
+    except Exception as e:
+        logger.exception("Ошибка при установке меню бота: %s", e)
+
+
+@user_router.message(F.text.regexp(r"^/setmenu\b"))
+async def cmd_set_menu(message: Message, state: FSMContext) -> None:
+    """
+    Обрабатывает команду /setmenu для обновления меню бота.
+    
+    Устанавливает команды бота в меню Telegram.
+    
+    Args:
+        message: Сообщение с командой
+        state: FSM контекст для управления состоянием
+    """
+    if not _check_admin(message.from_user.id):
+        await message.answer("⛔️ Недостаточно прав.")
+        return
+    
+    # Очищаем состояние, если было активно
+    await state.clear()
+    
+    try:
+        await setup_bot_menu()
         await message.answer("✅ Меню бота успешно обновлено!")
     except Exception as e:
         logger.exception("Ошибка при обновлении меню бота: %s", e)
