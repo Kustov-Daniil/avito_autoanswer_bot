@@ -179,3 +179,4 @@ russian_trusted_root_ca.cer
 cv_processing.db
 еxamples
 .env
+data/

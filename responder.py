@@ -29,6 +29,8 @@ MAX_FAQ_MATCHES: int = 5  # Увеличено для лучшего покры�
 FAQ_SIMILARITY_CUTOFF: float = 0.50  # Базовый порог (адаптивный)
 FAQ_SIMILARITY_CUTOFF_MIN: float = 0.45  # Минимальный порог для коротких текстов
 FAQ_SIMILARITY_CUTOFF_MAX: float = 0.65  # Максимальный порог для длинных текстов
+FAQ_EXACT_MATCH_THRESHOLD: float = 0.90  # Порог для точного совпадения (P0)
+MAX_AVITO_MESSAGE_LENGTH: int = 950  # Ограничение Avito API
 
 # Инициализация OpenAI клиента
 if not OPENAI_API_KEY:
@@ -104,19 +106,27 @@ def _normalize_text(text: str) -> str:
     """
     Нормализует текст для лучшего сравнения.
     
+    Убирает ссылки, @упоминания, пунктуацию, приводит к нижнему регистру.
+    
     Args:
         text: Исходный текст
         
     Returns:
-        Нормализованный текст (lowercase, без лишних пробелов)
+        Нормализованный текст (lowercase, без ссылок, упоминаний, пунктуации)
     """
     if not text:
         return ""
-    # Приводим к нижнему регистру и убираем лишние пробелы
+    # Приводим к нижнему регистру
     normalized = text.lower().strip()
+    # Убираем ссылки (http://, https://, www.)
+    normalized = re.sub(r'https?://\S+|www\.\S+', '', normalized)
+    # Убираем @упоминания
+    normalized = re.sub(r'@\w+', '', normalized)
+    # Убираем пунктуацию
+    normalized = re.sub(r'[^\w\s]', '', normalized)
     # Убираем множественные пробелы
     normalized = re.sub(r'\s+', ' ', normalized)
-    return normalized
+    return normalized.strip()
 
 
 def _calculate_adaptive_cutoff(text: str) -> float:
@@ -143,6 +153,53 @@ def _calculate_adaptive_cutoff(text: str) -> float:
     else:
         # Длинные вопросы - более высокий порог для точности
         return FAQ_SIMILARITY_CUTOFF_MAX
+
+
+def _find_exact_faq_match(incoming_text: str, faq_data: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """
+    Ищет точное совпадение вопроса с FAQ (≥0.9 схожести после нормализации).
+    
+    Используется для P0 приоритета - возвращает оригинальный ответ из FAQ без изменений.
+    
+    Args:
+        incoming_text: Входящий текст пользователя
+        faq_data: Список FAQ записей [{"question": str, "answer": str}]
+        
+    Returns:
+        FAQ запись с максимальной схожестью ≥0.9 или None если не найдено
+    """
+    if not faq_data or not incoming_text:
+        return None
+    
+    # Нормализуем входящий текст
+    normalized_incoming = _normalize_text(incoming_text)
+    
+    best_match = None
+    best_score = 0.0
+    
+    for item in faq_data:
+        q = item.get("question", "")
+        if not q:
+            continue
+        
+        normalized_q = _normalize_text(q)
+        
+        # Вычисляем схожесть
+        similarity = difflib.SequenceMatcher(None, normalized_incoming, normalized_q).ratio()
+        
+        if similarity > best_score:
+            best_score = similarity
+            best_match = item
+    
+    # Возвращаем только если схожесть ≥0.9
+    if best_score >= FAQ_EXACT_MATCH_THRESHOLD:
+        logger.info(
+            "Exact FAQ match found: similarity=%.2f, question='%s'",
+            best_score, best_match.get("question", "")[:50] if best_match else ""
+        )
+        return best_match
+    
+    return None
 
 
 def _build_faq_context(incoming_text: str, faq_data: List[Dict[str, str]]) -> str:
@@ -254,6 +311,11 @@ async def generate_reply(
     
     Единая генерация ответа для Avito и для Telegram.
     
+    Приоритеты:
+    - P0: Если найден точный матч FAQ (≥0.9) → возвращает оригинальный ответ из FAQ без изменений
+    - P1: Если матча нет → генерирует ответ из динамики через LLM
+    - P2: Стиль применяется только если не меняет содержимое P0/P1
+    
     Args:
         dialog_id: Уникальный ID диалога (например, "avito_123" или "tg_456")
         incoming_text: Входящий текст от пользователя
@@ -267,6 +329,40 @@ async def generate_reply(
     if not incoming_text or not incoming_text.strip():
         logger.warning("generate_reply called with empty incoming_text")
         return "Извините, не получилось обработать ваше сообщение. Попробуйте еще раз.", {"contains_signal_phrase": False}
+    
+    # Загружаем FAQ для проверки точного совпадения (P0)
+    faq_data = _load_json(FAQ_PATH, [])
+    
+    # P0: Проверяем точное совпадение с FAQ (≥0.9 схожести)
+    exact_match = _find_exact_faq_match(incoming_text, faq_data)
+    if exact_match:
+        # Найден точный матч - возвращаем оригинальный ответ из FAQ без изменений
+        faq_answer = exact_match.get("answer", "").strip()
+        if faq_answer:
+            logger.info(
+                "P0 FAQ_MATCH: Returning exact FAQ answer for dialog_id=%s, question='%s'",
+                dialog_id, exact_match.get("question", "")[:50]
+            )
+            
+            # Обрезаем до 950 символов если нужно (ограничение Avito API)
+            if len(faq_answer) > MAX_AVITO_MESSAGE_LENGTH:
+                # Обрезаем до 950 символов, стараясь не обрезать слово посередине
+                truncated = faq_answer[:MAX_AVITO_MESSAGE_LENGTH]
+                last_space = truncated.rfind(' ')
+                if last_space > MAX_AVITO_MESSAGE_LENGTH - 50:  # Если пробел не слишком далеко
+                    truncated = truncated[:last_space]
+                faq_answer = truncated + "..."
+                logger.info("FAQ answer truncated to %d characters", len(faq_answer))
+            
+            # Сохраняем сообщение пользователя в историю
+            from utils.chat_history import save_user_message
+            save_user_message(dialog_id, incoming_text)
+            
+            # Возвращаем оригинальный ответ из FAQ
+            return faq_answer, {"contains_signal_phrase": False}
+    
+    # P1: Точного матча нет - генерируем ответ через LLM
+    logger.info("P1 DYNAMIC: No exact FAQ match, generating answer via LLM for dialog_id=%s", dialog_id)
     
     # Загружаем историю диалога
     chat_history = _load_json(CHAT_HISTORY_PATH, {})
@@ -288,9 +384,6 @@ async def generate_reply(
     save_user_message(dialog_id, incoming_text)
     
     logger.info("Saved user message to chat history for dialog_id=%s", dialog_id)
-    
-    # Загружаем FAQ и контексты
-    faq_data = _load_json(FAQ_PATH, [])
     
     # Загружаем статический контекст
     try:
