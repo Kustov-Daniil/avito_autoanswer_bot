@@ -180,3 +180,5 @@ cv_processing.db
 еxamples
 .env
 data/
+.DS_Store
+*.DS_Store

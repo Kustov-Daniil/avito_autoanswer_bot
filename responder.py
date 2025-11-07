@@ -155,11 +155,106 @@ def _calculate_adaptive_cutoff(text: str) -> float:
         return FAQ_SIMILARITY_CUTOFF_MAX
 
 
+async def _improve_faq_answer(faq_answer: str, incoming_text: str, dialog_id: str) -> Optional[str]:
+    """
+    Улучшает ответ из FAQ через LLM: исправляет ошибки, улучшает формулировки.
+    
+    Сохраняет смысл и структуру ответа, но исправляет опечатки, пунктуацию,
+    улучшает формулировки и стиль.
+    
+    Args:
+        faq_answer: Оригинальный ответ из FAQ
+        incoming_text: Входящий текст пользователя
+        dialog_id: ID диалога
+        
+    Returns:
+        Улучшенный ответ или None если произошла ошибка
+    """
+    if not client:
+        logger.warning("OpenAI client not initialized, cannot improve FAQ answer")
+        return None
+    
+    # Получаем актуальную модель LLM
+    current_model = get_llm_model(LLM_MODEL)
+    
+    improvement_prompt = f"""Ты — эксперт по редактированию текстов.
+
+Вот ответ из FAQ базы знаний, который нужно улучшить:
+
+{faq_answer}
+
+ЗАДАЧА:
+Улучши этот ответ, исправив:
+- Орфографические ошибки
+- Пунктуацию
+- Грамматические ошибки
+- Стиль и формулировки (сделай более вежливым и профессиональным)
+
+ВАЖНО:
+- НЕ меняй смысл и факты ответа
+- НЕ добавляй новую информацию
+- НЕ удаляй важную информацию
+- НЕ меняй структуру ответа кардинально
+- Сохрани все ключевые детали и данные
+- Ответ должен быть не более 950 символов (ограничение Avito API)
+- Убери звездочки и решетки из ответа
+
+Вопрос клиента для контекста: {incoming_text}
+
+Верни только улучшенный ответ, без дополнительных комментариев."""
+
+    try:
+        use_temperature = current_model not in ["gpt-5-mini", "gpt-5"]
+        
+        if use_temperature:
+            response = await client.chat.completions.create(
+                model=current_model,
+                messages=[{"role": "user", "content": improvement_prompt}],
+                temperature=0.3,  # Низкая температура для более точного редактирования
+            )
+        else:
+            response = await client.chat.completions.create(
+                model=current_model,
+                messages=[{"role": "user", "content": improvement_prompt}],
+            )
+        
+        if not response.choices or not response.choices[0].message:
+            logger.warning("LLM returned no response for FAQ improvement")
+            return None
+        
+        improved_answer = response.choices[0].message.content
+        if improved_answer:
+            improved_answer = improved_answer.strip()
+            
+            # Обрезаем до 950 символов если нужно
+            if len(improved_answer) > MAX_AVITO_MESSAGE_LENGTH:
+                truncated = improved_answer[:MAX_AVITO_MESSAGE_LENGTH]
+                last_space = truncated.rfind(' ')
+                if last_space > MAX_AVITO_MESSAGE_LENGTH - 50:
+                    truncated = truncated[:last_space]
+                improved_answer = truncated + "..."
+                logger.info("Improved FAQ answer truncated to %d characters", len(improved_answer))
+            
+            logger.info(
+                "FAQ answer improved: original_length=%d, improved_length=%d for dialog_id=%s",
+                len(faq_answer), len(improved_answer), dialog_id
+            )
+            return improved_answer
+        else:
+            logger.warning("LLM returned empty improved answer")
+            return None
+            
+    except Exception as e:
+        logger.exception("Error improving FAQ answer via LLM: %s", e)
+        return None
+
+
 def _find_exact_faq_match(incoming_text: str, faq_data: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
     """
     Ищет точное совпадение вопроса с FAQ (≥0.9 схожести после нормализации).
     
-    Используется для P0 приоритета - возвращает оригинальный ответ из FAQ без изменений.
+    Используется для P0 приоритета - найденный ответ будет улучшен через LLM
+    (исправление ошибок, улучшение формулировок, но сохранение смысла).
     
     Args:
         incoming_text: Входящий текст пользователя
@@ -312,7 +407,8 @@ async def generate_reply(
     Единая генерация ответа для Avito и для Telegram.
     
     Приоритеты:
-    - P0: Если найден точный матч FAQ (≥0.9) → возвращает оригинальный ответ из FAQ без изменений
+    - P0: Если найден точный матч FAQ (≥0.9) → улучшает ответ из FAQ через LLM
+      (исправляет ошибки, улучшает формулировки, но сохраняет смысл)
     - P1: Если матча нет → генерирует ответ из динамики через LLM
     - P2: Стиль применяется только если не меняет содержимое P0/P1
     
@@ -336,30 +432,33 @@ async def generate_reply(
     # P0: Проверяем точное совпадение с FAQ (≥0.9 схожести)
     exact_match = _find_exact_faq_match(incoming_text, faq_data)
     if exact_match:
-        # Найден точный матч - возвращаем оригинальный ответ из FAQ без изменений
+        # Найден точный матч - улучшаем ответ из FAQ через LLM
         faq_answer = exact_match.get("answer", "").strip()
         if faq_answer:
             logger.info(
-                "P0 FAQ_MATCH: Returning exact FAQ answer for dialog_id=%s, question='%s'",
+                "P0 FAQ_MATCH: Found exact FAQ match for dialog_id=%s, question='%s', improving answer via LLM",
                 dialog_id, exact_match.get("question", "")[:50]
             )
-            
-            # Обрезаем до 950 символов если нужно (ограничение Avito API)
-            if len(faq_answer) > MAX_AVITO_MESSAGE_LENGTH:
-                # Обрезаем до 950 символов, стараясь не обрезать слово посередине
-                truncated = faq_answer[:MAX_AVITO_MESSAGE_LENGTH]
-                last_space = truncated.rfind(' ')
-                if last_space > MAX_AVITO_MESSAGE_LENGTH - 50:  # Если пробел не слишком далеко
-                    truncated = truncated[:last_space]
-                faq_answer = truncated + "..."
-                logger.info("FAQ answer truncated to %d characters", len(faq_answer))
             
             # Сохраняем сообщение пользователя в историю
             from utils.chat_history import save_user_message
             save_user_message(dialog_id, incoming_text)
             
-            # Возвращаем оригинальный ответ из FAQ
-            return faq_answer, {"contains_signal_phrase": False}
+            # Улучшаем ответ из FAQ через LLM
+            improved_answer = await _improve_faq_answer(faq_answer, incoming_text, dialog_id)
+            
+            if improved_answer:
+                return improved_answer, {"contains_signal_phrase": False}
+            else:
+                # Если улучшение не удалось, возвращаем оригинальный ответ
+                logger.warning("Failed to improve FAQ answer, returning original for dialog_id=%s", dialog_id)
+                if len(faq_answer) > MAX_AVITO_MESSAGE_LENGTH:
+                    truncated = faq_answer[:MAX_AVITO_MESSAGE_LENGTH]
+                    last_space = truncated.rfind(' ')
+                    if last_space > MAX_AVITO_MESSAGE_LENGTH - 50:
+                        truncated = truncated[:last_space]
+                    faq_answer = truncated + "..."
+                return faq_answer, {"contains_signal_phrase": False}
     
     # P1: Точного матча нет - генерируем ответ через LLM
     logger.info("P1 DYNAMIC: No exact FAQ match, generating answer via LLM for dialog_id=%s", dialog_id)

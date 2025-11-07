@@ -13,6 +13,19 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Получаем полную историю для git describe
+
+    - name: Update version
+      run: |
+        # Генерируем версию на основе даты/времени и короткого хеша коммита
+        VERSION_DATE=$(date +"%Y%m%d-%H%M%S")
+        COMMIT_HASH=$(git rev-parse --short HEAD)
+        VERSION="1.0.0-${VERSION_DATE}-${COMMIT_HASH}"
+        echo "Updating version to: $VERSION"
+        echo "$VERSION" > version.txt
+        echo "Version file created:"
+        cat version.txt
 
     - name: Setup SSH
       uses: webfactory/ssh-agent@v0.9.0
@@ -25,7 +38,26 @@ jobs:
 
     - name: Deploy to Server
       run: |
+        # Сохраняем папку data/ на сервере перед деплоем (если существует)
+        ssh -o StrictHostKeyChecking=no root@${{ secrets.SERVER_HOST }} << 'EOF'
+          cd /home/avito_autoanswer_bot
+          if [ -d "data" ]; then
+            echo "Сохраняем папку data/ на сервере..."
+            # Создаем временную резервную копию
+            if [ -d "data_backup" ]; then
+              rm -rf data_backup
+            fi
+            cp -r data data_backup || true
+          else
+            echo "Папка data/ не существует, создаем структуру..."
+            mkdir -p data/logs
+            touch data/.gitkeep
+            touch data/logs/.gitkeep
+          fi
+        EOF
+        
         # Исключаем ненужные файлы при синхронизации
+        # ВАЖНО: data/ полностью исключается из синхронизации
         rsync -avz --delete \
           --exclude='.git' \
           --exclude='.github' \
@@ -33,9 +65,33 @@ jobs:
           --exclude='*.pyc' \
           --exclude='.env' \
           --exclude='venv' \
-          --exclude='data/logs/*.log' \
+          --exclude='data/' \
+          --exclude='data_backup/' \
           -e "ssh -o StrictHostKeyChecking=no" \
           ./ root@${{ secrets.SERVER_HOST }}:/home/avito_autoanswer_bot/
+        
+        # Восстанавливаем папку data/ на сервере после деплоя
+        ssh -o StrictHostKeyChecking=no root@${{ secrets.SERVER_HOST }} << 'EOF'
+          cd /home/avito_autoanswer_bot
+          if [ -d "data_backup" ]; then
+            echo "Восстанавливаем папку data/ на сервере..."
+            # Удаляем пустую папку data/ если она была создана из репозитория
+            if [ -d "data" ] && [ ! -f "data/.gitkeep" ]; then
+              rm -rf data
+            fi
+            # Восстанавливаем из резервной копии
+            mv data_backup data
+            echo "Папка data/ восстановлена"
+          else
+            # Если резервной копии нет, создаем структуру
+            if [ ! -d "data" ]; then
+              mkdir -p data/logs
+              touch data/.gitkeep
+              touch data/logs/.gitkeep
+              echo "Создана новая папка data/"
+            fi
+          fi
+        EOF
         
         # Обновляем зависимости на сервере
         ssh -o StrictHostKeyChecking=no root@${{ secrets.SERVER_HOST }} << 'EOF'

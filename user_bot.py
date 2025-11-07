@@ -30,7 +30,7 @@ from create_bot import bot
 from config import (
     FAQ_PATH, STATIC_CONTEXT_PATH, DYNAMIC_CONTEXT_PATH, SYSTEM_PROMPT_PATH, CHAT_HISTORY_PATH,
     LLM_MODEL, TEMPERATURE, OPENAI_API_KEY, ADMINS, WEBHOOK_URL, DATA_DIR, SIGNAL_PHRASES,
-    MANAGER_COST_PER_HOUR, USD_RATE
+    MANAGER_COST_PER_HOUR, USD_RATE, get_bot_version
 )
 from avito_sessions import set_bot_enabled, is_bot_enabled, get_llm_model, set_llm_model
 from responder import generate_reply
@@ -388,6 +388,9 @@ async def cmd_bot_status_menu(message: Message, state: FSMContext) -> None:
     }
     current_model_name = model_display_names.get(current_model, current_model)
     
+    # Получаем версию бота
+    bot_version = get_bot_version()
+    
     # Создаем inline кнопки в зависимости от текущего статуса
     buttons = []
     
@@ -411,9 +414,11 @@ async def cmd_bot_status_menu(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"🤖 Управление ботом\n\n"
         f"📊 Текущий статус бота: {status_text}\n"
-        f"🤖 Текущая модель LLM: {current_model_name}\n\n"
+        f"🤖 Текущая модель LLM: {current_model_name}\n"
+        f"📦 Версия бота: <b>{bot_version}</b>\n\n"
         "Выберите действие:",
-        reply_markup=keyboard
+        reply_markup=keyboard,
+        parse_mode="HTML"
     )
 
 
@@ -432,6 +437,7 @@ async def callback_bot_on(callback: CallbackQuery) -> None:
         "gpt-4o": "Chat GPT 4o"
     }
     current_model_name = model_display_names.get(current_model, current_model)
+    bot_version = get_bot_version()
     
     buttons = []
     buttons.append([InlineKeyboardButton(text="🔴 Выключить бота", callback_data="bot_off")])
@@ -445,10 +451,12 @@ async def callback_bot_on(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         f"🤖 Управление ботом\n\n"
         f"📊 Текущий статус бота: {status_text}\n"
-        f"🤖 Текущая модель LLM: {current_model_name}\n\n"
+        f"🤖 Текущая модель LLM: {current_model_name}\n"
+        f"📦 Версия бота: <b>{bot_version}</b>\n\n"
         "✅ Бот включен. Теперь он будет отвечать на сообщения из Avito.\n\n"
         "Выберите действие:",
-        reply_markup=keyboard
+        reply_markup=keyboard,
+        parse_mode="HTML"
     )
 
 
@@ -467,6 +475,7 @@ async def callback_bot_off(callback: CallbackQuery) -> None:
         "gpt-4o": "Chat GPT 4o"
     }
     current_model_name = model_display_names.get(current_model, current_model)
+    bot_version = get_bot_version()
     
     buttons = []
     buttons.append([InlineKeyboardButton(text="🟢 Включить бота", callback_data="bot_on")])
@@ -480,10 +489,12 @@ async def callback_bot_off(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         f"🤖 Управление ботом\n\n"
         f"📊 Текущий статус бота: {status_text}\n"
-        f"🤖 Текущая модель LLM: {current_model_name}\n\n"
+        f"🤖 Текущая модель LLM: {current_model_name}\n"
+        f"📦 Версия бота: <b>{bot_version}</b>\n\n"
         "⛔️ Бот выключен. Он не будет отвечать на сообщения из Avito.\n\n"
         "Выберите действие:",
-        reply_markup=keyboard
+        reply_markup=keyboard,
+        parse_mode="HTML"
     )
 
 
@@ -630,6 +641,7 @@ async def callback_bot_status_back(callback: CallbackQuery) -> None:
         "gpt-4o": "Chat GPT 4o"
     }
     current_model_name = model_display_names.get(current_model, current_model)
+    bot_version = get_bot_version()
     
     buttons = []
     if current_status:
@@ -646,9 +658,11 @@ async def callback_bot_status_back(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         f"🤖 Управление ботом\n\n"
         f"📊 Текущий статус бота: {status_text}\n"
-        f"🤖 Текущая модель LLM: {current_model_name}\n\n"
+        f"🤖 Текущая модель LLM: {current_model_name}\n"
+        f"📦 Версия бота: <b>{bot_version}</b>\n\n"
         "Выберите действие:",
-        reply_markup=keyboard
+        reply_markup=keyboard,
+        parse_mode="HTML"
     )
 
 

@@ -6,6 +6,7 @@
 """
 
 import os
+import logging
 from typing import Optional, List
 from dotenv import load_dotenv
 
@@ -144,7 +145,32 @@ DYNAMIC_CONTEXT_PATH: str = os.path.join(DATA_DIR, "dynamic_context.txt")
 SYSTEM_PROMPT_PATH: str = os.path.join(DATA_DIR, "system_prompt.txt")
 BOT_STATE_PATH: str = os.path.join(DATA_DIR, "bot_state.json")
 CHAT_HISTORY_PATH: str = os.path.join(DATA_DIR, "chat_history.json")
+VERSION_PATH: str = "version.txt"  # Файл версии (не в data/, чтобы коммитился)
 
 # Публичная база (для вебхука)
 PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 WEBHOOK_URL: str = f"{PUBLIC_BASE_URL}/avito/webhook" if PUBLIC_BASE_URL else ""
+
+
+def get_bot_version() -> str:
+    """
+    Получает версию бота из файла version.txt.
+    
+    Returns:
+        Версия бота или "unknown" если файл не найден
+    """
+    try:
+        if os.path.exists(VERSION_PATH):
+            with open(VERSION_PATH, "r", encoding="utf-8") as f:
+                version = f.read().strip()
+                return version if version else "unknown"
+        else:
+            # Если файла нет, создаем с дефолтной версией
+            default_version = "1.0.0"
+            os.makedirs(os.path.dirname(VERSION_PATH) if os.path.dirname(VERSION_PATH) else ".", exist_ok=True)
+            with open(VERSION_PATH, "w", encoding="utf-8") as f:
+                f.write(default_version)
+            return default_version
+    except Exception as e:
+        logging.warning("Failed to read bot version: %s", e)
+        return "unknown"
