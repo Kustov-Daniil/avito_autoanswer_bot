@@ -11,11 +11,12 @@ import re
 import json
 import os
 import shutil
+import time
 from datetime import datetime
 from typing import Dict, Any, Optional, Callable, Awaitable, List
 from flask import Flask, request, jsonify, Response
 from aiogram import F
-from aiogram.types import Message, MessageReactionUpdated
+from aiogram.types import Message
 
 from create_bot import bot, dp
 from aiogram import Bot
@@ -23,13 +24,27 @@ from aiogram.client.default import DefaultBotProperties
 from config import (
     TELEGRAM_MANAGER_ID, TELEGRAM_MANAGERS, TELEGRAM_BOT_TOKEN,
     AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_ACCOUNT_ID,
-    SIGNAL_PHRASES, DATA_DIR, COOLDOWN_MINUTES_AFTER_MANAGER, ADMINS, FAQ_PATH
+    SIGNAL_PHRASES, DATA_DIR, COOLDOWN_MINUTES_AFTER_MANAGER, ADMINS
 )
 from avito_api import send_message, list_messages_v3
-from avito_sessions import can_bot_reply, set_waiting_manager, set_cooldown_after_manager
+from avito_sessions import (
+    can_bot_reply, should_bot_reply, set_waiting_manager, set_cooldown_after_manager,
+    get_bot_mode, BOT_MODE_LISTENING, is_bot_enabled, get_partial_percentage
+)
+from utils.avito_accounts import (
+    get_account,
+    is_account_paused,
+    register_seen_account,
+    get_account_credentials,
+    list_accounts,
+)
 from responder import generate_reply
 from user_bot import user_router
 from telegram_utils import safe_send_message, safe_send_message_to_chat
+
+# Если по аккаунту не приходят webhook — включаем fallback polling (чтобы “слушать” второй аккаунт).
+# Обновляется при каждом входящем webhook.
+LAST_WEBHOOK_TS_BY_ACCOUNT: Dict[str, float] = {}
 
 # Настройка логирования: вывод в файл и в консоль
 LOG_DIR = os.path.join(DATA_DIR, "logs")
@@ -91,12 +106,9 @@ def check_config() -> bool:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not TELEGRAM_MANAGERS:
         missing.append("MANAGERS или TELEGRAM_MANAGER_ID")
-    if not AVITO_CLIENT_ID:
-        missing.append("AVITO_CLIENT_ID")
-    if not AVITO_CLIENT_SECRET:
-        missing.append("AVITO_CLIENT_SECRET")
-    if not AVITO_ACCOUNT_ID:
-        missing.append("AVITO_ACCOUNT_ID")
+    # AVITO_CLIENT_ID/SECRET могут быть не заданы, если они хранятся per-account в data/avito_accounts.json
+    # AVITO_ACCOUNT_ID теперь опционален: при multi-account account_id может приходить в webhook payload.
+    # Если он не задан — используем account_id из webhook (если Avito его присылает).
     
     if missing:
         logger.error("Missing required environment variables: %s", ", ".join(missing))
@@ -107,9 +119,9 @@ def check_config() -> bool:
     logger.info("  TELEGRAM_BOT_TOKEN: %s", "✓" if TELEGRAM_BOT_TOKEN else "✗")
     logger.info("  ADMINS: %s", ADMINS if ADMINS else "✗ NOT SET!")
     logger.info("  TELEGRAM_MANAGERS: %s", TELEGRAM_MANAGERS if TELEGRAM_MANAGERS else "✗ NOT SET!")
-    logger.info("  AVITO_CLIENT_ID: %s", "✓" if AVITO_CLIENT_ID else "✗")
-    logger.info("  AVITO_CLIENT_SECRET: %s", "✓" if AVITO_CLIENT_SECRET else "✗")
-    logger.info("  AVITO_ACCOUNT_ID: %s", AVITO_ACCOUNT_ID if AVITO_ACCOUNT_ID else "✗ NOT SET!")
+    logger.info("  AVITO_CLIENT_ID: %s", "✓" if AVITO_CLIENT_ID else "⚠️ NOT SET (per-account creds)")
+    logger.info("  AVITO_CLIENT_SECRET: %s", "✓" if AVITO_CLIENT_SECRET else "⚠️ NOT SET (per-account creds)")
+    logger.info("  AVITO_ACCOUNT_ID: %s", AVITO_ACCOUNT_ID if AVITO_ACCOUNT_ID else "⚠️ NOT SET (multi-account via webhook)")
     
     return True
 
@@ -122,6 +134,33 @@ app = Flask(__name__)
 
 # Регистрируем router для команд и ответов в Telegram
 dp.include_router(user_router)
+
+
+def _process_dialog_for_faq_async(dialog_id: str) -> None:
+    """
+    Асинхронно обрабатывает диалог для формирования FAQ.
+    
+    Запускает обработку в фоне, не блокируя основной поток.
+    Во всех режимах бот учится и наращивает базу знаний.
+    
+    Args:
+        dialog_id: ID диалога (например, "avito_123")
+    """
+    try:
+        from utils.faq_from_history import process_dialog_for_faq
+        from responder import client as llm_client
+        
+        # Запускаем обработку в фоне через run_async_in_thread
+        # Это работает как из async, так и из sync контекста
+        async def process_task():
+            try:
+                await process_dialog_for_faq(dialog_id, llm_client)
+            except Exception as e:
+                logger.debug("Error in FAQ processing task for dialog_id=%s: %s", dialog_id, e)
+        
+        run_async_in_thread(process_task())
+    except Exception as e:
+        logger.debug("Failed to start FAQ processing for dialog_id=%s: %s", dialog_id, e)
 
 
 def run_async_in_thread(coro: Awaitable[Any]) -> None:
@@ -170,7 +209,9 @@ async def _notify_manager_for_chat(
     chat_id: str,
     text: str,
     data: Dict[str, Any],
-    thread_bot: Bot
+    thread_bot: Bot,
+    *,
+    account_id: Optional[str] = None
 ) -> None:
     """
     Уведомляет менеджера в Telegram о сообщении из Avito.
@@ -191,7 +232,8 @@ async def _notify_manager_for_chat(
     try:
         # Получаем информацию о чате (объявление, аккаунт, собеседник, локация)
         from avito_api import get_chat
-        chat_info = get_chat(chat_id)
+        cid, csec = resolve_credentials_for_account(account_id)
+        chat_info = get_chat(chat_id, account_id=account_id, client_id=cid, client_secret=csec)
         if chat_info:
             logger.info("Retrieved chat info for chat %s: %s", chat_id, json.dumps(chat_info, indent=2, ensure_ascii=False)[:500])
             # Извлекаем имя пользователя из chat_info
@@ -212,7 +254,8 @@ async def _notify_manager_for_chat(
     
     try:
         logger.info("Fetching message history for chat %s", chat_id)
-        history = list_messages_v3(chat_id, limit=50, offset=0)
+        cid, csec = resolve_credentials_for_account(account_id)
+        history = list_messages_v3(chat_id, limit=50, offset=0, account_id=account_id, client_id=cid, client_secret=csec)
         logger.info("Retrieved %d messages from history for chat %s", len(history), chat_id)
         if history:
             logger.debug("First message sample: %s", json.dumps(history[0] if history else {}, indent=2, ensure_ascii=False)[:300])
@@ -259,76 +302,12 @@ async def _notify_manager_for_chat(
     logger.info("📨 Уведомления отправлены %d из %d менеджеров для чата %s", success_count, len(TELEGRAM_MANAGERS), chat_id)
 
 
-def _add_manager_reply_to_faq(notification_message: Message, manager_answer: str) -> None:
-    """
-    Добавляет ответ менеджера в FAQ автоматически.
-    
-    Извлекает вопрос клиента из уведомления и добавляет пару вопрос-ответ в FAQ.
-    Использует единую функцию добавления FAQ с проверкой уникальности и валидацией.
-    
-    Args:
-        notification_message: Сообщение-уведомление от бота (reply_to_message)
-        manager_answer: Ответ менеджера
-    """
-    try:
-        if not notification_message or not notification_message.text:
-            return
-        
-        notification_text = notification_message.text
-        
-        # Извлекаем вопрос клиента из уведомления
-        # Ищем строку "💬 ТЕКУЩЕЕ СООБЩЕНИЕ:" и текст после "👤 {client_name}:"
-        question = None
-        
-        # Паттерн для извлечения вопроса клиента
-        # Формат: "💬 ТЕКУЩЕЕ СООБЩЕНИЕ:\n👤 {client_name}: {question}"
-        current_message_match = re.search(r'💬\s*ТЕКУЩЕЕ\s*СООБЩЕНИЕ[:\s]*\n.*?👤\s*[^:]+:\s*(.+?)(?:\n|$)', notification_text, re.IGNORECASE | re.DOTALL)
-        if current_message_match:
-            question = current_message_match.group(1).strip()
-        
-        # Если не нашли, пробуем найти в истории переписки (последнее сообщение от клиента)
-        if not question:
-            # Ищем последнее сообщение клиента в истории
-            history_match = re.search(r'👤\s*[^:]+:\s*(.+?)(?:\n|$)', notification_text, re.IGNORECASE | re.DOTALL)
-            if history_match:
-                question = history_match.group(1).strip()
-        
-        if not question:
-            logger.warning("Не удалось извлечь вопрос клиента из уведомления для добавления в FAQ. Текст уведомления: %s", notification_text[:500])
-            return
-        
-        if not manager_answer:
-            logger.warning("Ответ менеджера пуст, не добавляем в FAQ")
-            return
-        
-        logger.info("Попытка добавить ответ менеджера в FAQ: вопрос='%s', ответ='%s' (длина: %d)", 
-                   question[:100], manager_answer[:100], len(manager_answer))
-        
-        # Используем единую функцию добавления FAQ с проверкой уникальности и валидацией
-        from utils.faq_utils import add_faq_entry_safe
-        success, message = add_faq_entry_safe(question, manager_answer, "manager")
-        
-        if success:
-            logger.info("✅ Ответ менеджера автоматически добавлен в FAQ: вопрос='%s'", question[:50])
-        else:
-            logger.warning("❌ Ответ менеджера не добавлен в FAQ: %s (вопрос: '%s', ответ: '%s')", 
-                          message, question[:50], manager_answer[:50])
-    except Exception as e:
-        logger.exception("Ошибка при добавлении ответа менеджера в FAQ: %s", e)
+"""
+Автоматическое пополнение faq.json удалено.
 
-
-def _add_manager_reply_to_faq_by_text(message_text: str, manager_answer: str) -> None:
-    """
-    Добавляет ответ менеджера в FAQ автоматически (для отправки по тексту).
-    
-    Args:
-        message_text: Текст сообщения менеджера (может содержать chat_id)
-        manager_answer: Ответ менеджера (текст после chat_id)
-    """
-    # Для отправки по тексту вопрос клиента не доступен напрямую
-    # Можно добавить только ответ, но без вопроса это не очень полезно
-    # Поэтому просто логируем
-    logger.debug("Отправка по тексту - вопрос клиента недоступен для добавления в FAQ")
+Теперь “база знаний” строится из chat_history через learning pipeline и пишется в:
+- data/knowledge_cards.json
+"""
 
 
 def format_manager_text_with_history(
@@ -716,6 +695,125 @@ def extract_text_from_webhook(data: Dict[str, Any]) -> str:
     return text
 
 
+def extract_account_id_from_webhook(data: Dict[str, Any]) -> Optional[str]:
+    """
+    Извлекает account_id (user_id аккаунта Avito) из webhook payload.
+
+    Поддерживает разные форматы webhook (v3 и другие).
+    """
+    payload = data.get("payload") or {}
+    payload_value = (payload.get("value") or {}) if isinstance(payload, dict) else {}
+
+    candidates = [
+        ("payload.value.user_id", payload_value.get("user_id")),
+        ("payload.value.account_id", payload_value.get("account_id")),
+        ("data.user_id", data.get("user_id")),
+        ("data.account_id", data.get("account_id")),
+        ("payload.user_id", payload.get("user_id") if isinstance(payload, dict) else None),
+        ("payload.account_id", payload.get("account_id") if isinstance(payload, dict) else None),
+        ("chat.account_id", (data.get("chat") or {}).get("account_id") if isinstance(data.get("chat"), dict) else None),
+    ]
+    
+    for path, c in candidates:
+        if c is None:
+            continue
+        s = str(c).strip()
+        if s.isdigit():
+            logger.debug("extract_account_id_from_webhook: found account_id=%s at path=%s", s, path)
+            return s
+    
+    logger.debug("extract_account_id_from_webhook: no account_id found in webhook payload")
+    return None
+
+
+def _session_key(chat_id: str, account_id: Optional[str]) -> str:
+    """
+    Ключ для avito_sessions (waiting_manager/cooldown) — делаем его account-aware.
+    """
+    aid = (str(account_id).strip() if account_id else "")
+    return f"{aid}:{chat_id}" if aid else chat_id
+
+
+def _should_bot_reply_for_account(chat_id: str, account_id: Optional[str]) -> tuple[bool, str, int]:
+    """
+    Решение: отвечать ли боту на входящее сообщение, учитывая настройки конкретного аккаунта.
+
+    Returns:
+      (should_reply, effective_mode, effective_partial_percentage)
+    """
+    # Глобальный OFF — мастер-переключатель
+    if not is_bot_enabled():
+        return False, "off", 0
+
+    acc = get_account(account_id) if account_id else None
+    if acc and bool(acc.get("paused", False)):
+        return False, "paused", int(acc.get("partial_percentage", 50) or 50)
+
+    # Если у аккаунта явно задан режим — используем его; иначе fallback на глобальный
+    effective_mode = (acc.get("mode") if acc else None) or get_bot_mode()
+    try:
+        effective_partial = int((acc.get("partial_percentage") if acc else None) or get_partial_percentage())
+    except Exception:
+        effective_partial = 50
+    effective_partial = max(0, min(100, effective_partial))
+
+    key = _session_key(chat_id, account_id)
+
+    # Пер-аккаунтный listening: не отвечаем, но считаем, что менеджера надо уведомлять (в main.py)
+    if effective_mode == BOT_MODE_LISTENING:
+        return False, effective_mode, effective_partial
+
+    # Full
+    if effective_mode == "full":
+        return can_bot_reply(key), effective_mode, effective_partial
+
+    # Partial
+    if effective_mode == "partial":
+        if not can_bot_reply(key):
+            return False, effective_mode, effective_partial
+        import hashlib
+        h = int(hashlib.md5(key.encode()).hexdigest(), 16)
+        return (h % 100) < effective_partial, effective_mode, effective_partial
+
+    # Неизвестный режим — безопасно не отвечаем
+    return False, str(effective_mode), effective_partial
+
+
+def resolve_account_id_for_chat(chat_id: str) -> Optional[str]:
+    """
+    Пытается определить account_id для конкретного Avito chat_id из chat_history meta.
+    """
+    if not chat_id:
+        return str(AVITO_ACCOUNT_ID).strip() if AVITO_ACCOUNT_ID else None
+    try:
+        from utils.chat_history import get_dialog_meta
+        meta = get_dialog_meta(f"avito_{chat_id}")
+        aid = (meta.get("account_id") or "").strip() if isinstance(meta, dict) else ""
+        if aid.isdigit():
+            return aid
+    except Exception:
+        pass
+    return str(AVITO_ACCOUNT_ID).strip() if AVITO_ACCOUNT_ID else None
+
+
+def resolve_credentials_for_account(account_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Возвращает (client_id, client_secret) для account_id.
+    Сначала пытаемся взять из data/avito_accounts.json; если нет — fallback на .env.
+    """
+    cid, csec = get_account_credentials(account_id)
+    if cid and csec:
+        return cid, csec
+    # fallback на .env
+    try:
+        from config import AVITO_CLIENT_ID as _CID, AVITO_CLIENT_SECRET as _CSEC
+        if _CID and _CSEC:
+            return str(_CID).strip(), str(_CSEC).strip()
+    except Exception:
+        pass
+    return None, None
+
+
 @app.route(HEALTH_ENDPOINT, methods=["GET"])
 def health() -> tuple[str, int]:
     """
@@ -740,21 +838,37 @@ def avito_webhook() -> Response:
     """
     data: Dict[str, Any] = request.json or {}
     
-    # Логируем полный webhook payload для диагностики (только если AVITO_ACCOUNT_ID не установлен)
-    if not AVITO_ACCOUNT_ID:
-        logger.warning("⚠️ AVITO_ACCOUNT_ID not set! Logging full webhook payload to help find it:")
-        logger.warning("Full webhook data: %s", data)
-        logger.warning("Webhook JSON structure:\n%s", json.dumps(data, indent=2, ensure_ascii=False))
+    # Логируем структуру webhook для диагностики multi-account
+    logger.info("=" * 80)
+    logger.info("📥 INCOMING WEBHOOK")
+    logger.info("=" * 80)
+    logger.info("Webhook payload structure (first 2000 chars):\n%s", json.dumps(data, indent=2, ensure_ascii=False)[:2000])
+    
+    # Извлекаем account_id ДО обработки, чтобы видеть его в логах
+    extracted_account_id = extract_account_id_from_webhook(data)
+    logger.info("🔍 Extracted account_id from webhook: %s", extracted_account_id)
+    if extracted_account_id:
+        LAST_WEBHOOK_TS_BY_ACCOUNT[str(extracted_account_id)] = time.time()
     
     # Извлекаем chat_id и текст
     chat_id = extract_chat_id_from_webhook(data)
     text = extract_text_from_webhook(data)
+    
+    # Извлекаем direction и другие метаданные для диагностики
+    payload_value = (data.get("payload") or {}).get("value") or {}
+    direction = payload_value.get("direction") or data.get("direction")
+    author_id = payload_value.get("author_id") or data.get("author_id")
+    message_type = payload_value.get("type") or data.get("type") or ""
+    
+    logger.info("📋 Webhook metadata: chat_id=%s, direction=%s, author_id=%s, type=%s, text_length=%d",
+               chat_id, direction, author_id, message_type, len(text) if text else 0)
 
     if not chat_id:
-        logger.warning("Webhook without chat_id: %s", data)
+        logger.warning("❌ Webhook without chat_id: %s", json.dumps(data, indent=2, ensure_ascii=False)[:1000])
         return jsonify({"ok": False, "error": "no chat_id"}), 400
 
-    logger.info("Received webhook: chat_id=%s, text_length=%d", chat_id, len(text) if text else 0)
+    logger.info("✅ Webhook received: chat_id=%s, account_id=%s, text_length=%d", 
+               chat_id, extracted_account_id or "NOT FOUND", len(text) if text else 0)
 
     async def notify_and_maybe_reply() -> None:
         """
@@ -770,6 +884,8 @@ def avito_webhook() -> Response:
             default=DefaultBotProperties(parse_mode="HTML")
         )
         try:
+            logger.info("🔄 Starting async webhook processing: chat_id=%s", chat_id)
+            
             # Получаем данные из webhook payload для проверки направления
             webhook_payload_value = (data.get("payload") or {}).get("value") or {}
             webhook_data = data
@@ -785,85 +901,211 @@ def avito_webhook() -> Response:
                 ""
             )
             
-            # Попытка определить AVITO_ACCOUNT_ID из webhook (если не установлен)
-            if not AVITO_ACCOUNT_ID:
-                potential_account_id = (
-                    data.get("user_id") or
-                    data.get("account_id") or
-                    (data.get("payload") or {}).get("user_id") or
-                    (data.get("payload") or {}).get("account_id")
-                )
-                if potential_account_id:
-                    logger.warning(
-                        "⚠️ AVITO_ACCOUNT_ID not set, but found potential account_id in webhook: %s",
-                        potential_account_id
-                    )
-                    logger.warning("   Please set AVITO_ACCOUNT_ID=%s in your .env file", potential_account_id)
+            logger.info("📊 Webhook metadata in async: direction=%s, author_id=%s, type=%s", 
+                       direction, author_id, message_type)
+
+            # account_id (user_id аккаунта Avito) — критично для multi-account
+            extracted_account_id = extract_account_id_from_webhook(data)
+            current_account_id = extracted_account_id or (str(AVITO_ACCOUNT_ID).strip() if AVITO_ACCOUNT_ID else None)
+            
+            # Детальное логирование для диагностики multi-account
+            logger.info("🔍 Account ID extraction: extracted=%s, fallback=%s, final=%s", 
+                       extracted_account_id, 
+                       str(AVITO_ACCOUNT_ID).strip() if AVITO_ACCOUNT_ID else None,
+                       current_account_id)
+            
+            if current_account_id:
+                try:
+                    from utils.chat_history import set_dialog_account_id
+                    set_dialog_account_id(f"avito_{chat_id}", current_account_id)
+                except Exception:
+                    pass
+                
+                # Проверяем, есть ли аккаунт в списке
+                acc_info = get_account(current_account_id)
+                if acc_info:
+                    logger.info("✅ Account found in accounts list: account_id=%s, name=%s, paused=%s, mode=%s",
+                               current_account_id, 
+                               acc_info.get("name", ""),
+                               acc_info.get("paused", False),
+                               acc_info.get("mode", ""))
+                else:
+                    logger.warning("⚠️ Account NOT found in accounts list: account_id=%s", current_account_id)
+            
+            # Лог для диагностики: если account_id не нашли
+            if not current_account_id:
+                logger.warning("⚠️ account_id not found in webhook for chat_id=%s (multi-account may not work)", chat_id)
+                logger.warning("   Webhook payload structure: %s", json.dumps(data, indent=2, ensure_ascii=False)[:1000])
             
             # Проверяем, может ли токен получить доступ к этому чату
-            if AVITO_ACCOUNT_ID:
+            if current_account_id:
                 try:
                     from avito_api import get_chat
-                    chat_info = get_chat(chat_id)
+                    cid, csec = resolve_credentials_for_account(current_account_id)
+                    logger.info("🔑 Credentials resolution for account_id=%s: client_id=%s, client_secret=%s",
+                               current_account_id,
+                               cid[:10] + "..." if cid and len(cid) > 10 else cid,
+                               "***" if csec else None)
+                    if not cid or not csec:
+                        logger.warning("❌ No client_id/client_secret for account_id=%s yet; cannot call get_chat", current_account_id)
+                        logger.warning("   Проверьте, что credentials установлены для этого аккаунта через команду /set_account_credentials")
+                        chat_info = None
+                    else:
+                        logger.info("🔍 Attempting to get chat info: chat_id=%s, account_id=%s", chat_id, current_account_id)
+                        chat_info = get_chat(chat_id, account_id=current_account_id, client_id=cid, client_secret=csec)
                     if chat_info:
-                        logger.info("✓ Доступ к чату подтвержден, можно отправлять сообщения")
+                        logger.info("✅ Доступ к чату подтвержден, можно отправлять сообщения")
+                        # зарегистрируем аккаунт в списке (если ещё не было)
+                        try:
+                            acc_name = ""
+                            acc_obj = chat_info.get("account") or {}
+                            if isinstance(acc_obj, dict):
+                                acc_name = acc_obj.get("name") or acc_obj.get("title") or ""
+                            register_seen_account(current_account_id, name=acc_name or None)
+                        except Exception:
+                            pass
                     else:
                         logger.warning("⚠️ Не удалось получить информацию о чате - возможна проблема с правами")
+                        logger.warning("   chat_id=%s, account_id=%s", chat_id, current_account_id)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "403" in error_str or "permission denied" in error_str:
                         logger.error("❌ 403 Permission Denied при проверке доступа к чату")
                         logger.error("   Это означает, что текущий account_id (%s) не имеет прав на этот чат",
-                                    AVITO_ACCOUNT_ID)
+                                    current_account_id)
                         logger.error("   Возможные решения:")
-                        logger.error("   1. Убедитесь, что AVITO_ACCOUNT_ID = ID основного аккаунта компании (не сотрудника)")
-                        logger.error("   2. Убедитесь, что AVITO_CLIENT_ID и AVITO_CLIENT_SECRET принадлежат компании")
+                        logger.error("   1. Убедитесь, что account_id = ID основного аккаунта компании (не сотрудника)")
+                        logger.error("   2. Убедитесь, что client_id и client_secret принадлежат этому аккаунту")
                         logger.error("   3. Проверьте права приложения в личном кабинете Avito")
+                        logger.error("   4. Проверьте, что credentials установлены правильно через /set_account_credentials")
                     else:
                         logger.warning("Предупреждение при проверке чата: %s", e)
+                        logger.exception("Полная информация об ошибке:")
             
             logger.info(
                 "Webhook message: chat_id=%s, direction=%s, author_id=%s, type=%s, text_length=%d",
                 chat_id, direction, author_id, message_type, len(text) if text else 0
             )
             
-            # ФИЛЬТРАЦИЯ 1: Игнорируем исходящие сообщения (от бота/компании)
+            # ОБРАБОТКА ИСХОДЯЩИХ СООБЩЕНИЙ: сохраняем в историю чата
             if direction == "out":
-                logger.info("Ignoring outgoing message (from bot/company) for chat %s", chat_id)
+                logger.info("Processing outgoing message (from bot/company) for chat %s", chat_id)
+                
+                # Игнорируем системные исходящие сообщения
+                if message_type and message_type.lower() in ["system", "service", "notification", "system_message"]:
+                    logger.info("Ignoring system outgoing message (type='%s') for chat %s", message_type, chat_id)
+                    return
+                
+                # Если нет текста - не обрабатываем
+                if not text or not text.strip():
+                    logger.info("Empty text in outgoing webhook for chat %s, skipping", chat_id)
+                    return
+                
+                # Сохраняем исходящее сообщение в историю чата
+                try:
+                    from utils.chat_history import save_assistant_message, save_avito_owner_message
+                    from responder import _load_json, CHAT_HISTORY_PATH
+                    
+                    dialog_id = f"avito_{chat_id}"
+                    
+                    # Проверяем, не является ли это сообщение дубликатом последнего сообщения в истории
+                    # (бот и владелец аккаунта сохраняют сообщения сразу после отправки)
+                    chat_history = _load_json(CHAT_HISTORY_PATH, {})
+                    dialog_history = chat_history.get(dialog_id, [])
+                    
+                    # Проверяем, не является ли это сообщение дубликатом последнего сообщения в истории
+                    # (бот и владелец аккаунта сохраняют сообщения сразу после отправки)
+                    is_duplicate = False
+                    if dialog_history:
+                        last_msg = dialog_history[-1]
+                        last_content = last_msg.get("content", "").strip()
+                        if last_content == text.strip():
+                            # Это дубликат последнего сообщения, пропускаем
+                            logger.debug(
+                                "Outgoing message is duplicate of last %s message, skipping",
+                                last_msg.get("role", "unknown")
+                            )
+                            is_duplicate = True
+                    
+                    if not is_duplicate:
+                        # Определяем роль отправителя:
+                        # - Если author_id совпадает с account_id, это сообщение от владельца аккаунта
+                        #   Сохраняем с ролью "avito_owner"
+                        # - Если author_id не совпадает, это сообщение от бота (assistant)
+                        
+                        if author_id and current_account_id and str(author_id).strip() == str(current_account_id).strip():
+                            # Это исходящее сообщение от владельца аккаунта
+                            save_avito_owner_message(dialog_id, text)
+                            logger.info("Saved outgoing message as avito_owner message for chat %s", chat_id)
+                            
+                            # Во всех режимах бот учится и формирует FAQ из истории
+                            # Особенно важно обработать после ответа владельца (завершенный диалог)
+                            _process_dialog_for_faq_async(dialog_id)
+                        else:
+                            # Сохраняем как assistant (бот) - если author_id не совпадает с account_id
+                            # или account_id не установлен
+                            save_assistant_message(dialog_id, text)
+                            logger.info("Saved outgoing message as assistant message for chat %s", chat_id)
+                            
+                            # Во всех режимах бот учится и формирует FAQ из истории
+                            _process_dialog_for_faq_async(dialog_id)
+                    
+                except Exception as e:
+                    logger.warning("Failed to save outgoing message to chat history: %s", e)
+                
+                # Исходящие сообщения не требуют дальнейшей обработки (генерации ответа и т.д.)
                 return
             
             # ФИЛЬТРАЦИЯ 2: Игнорируем сообщения, если они не входящие (должны быть "in")
             # Но если direction не указан, пропускаем (может быть другой формат webhook)
             if direction is not None and direction != "in":
-                logger.info("Ignoring message with direction='%s' (expected 'in') for chat %s", direction, chat_id)
+                logger.info("⏭️ Ignoring message with direction='%s' (expected 'in') for chat %s, account_id=%s", 
+                           direction, chat_id, current_account_id)
                 return
             
             # ФИЛЬТРАЦИЯ 3: Игнорируем системные сообщения от Avito
             system_types = ["system", "service", "notification", "system_message"]
             if message_type and message_type.lower() in system_types:
-                logger.info("Ignoring system message (type='%s') for chat %s", message_type, chat_id)
+                logger.info("⏭️ Ignoring system message (type='%s') for chat %s, account_id=%s", 
+                           message_type, chat_id, current_account_id)
                 return
             
-            # ФИЛЬТРАЦИЯ 4: Проверяем, что сообщение не от нашего аккаунта (если author_id совпадает с account_id)
-            if AVITO_ACCOUNT_ID and author_id:
-                # Преобразуем в строки для сравнения
+            # ФИЛЬТРАЦИЯ 4: Обработка входящих сообщений от владельца аккаунта
+            # Если это входящее сообщение от нашего аккаунта - это сообщение от владельца аккаунта
+            # Сохраняем его в историю с ролью "avito_owner", но НЕ генерируем ответ бота
+            if current_account_id and author_id:
                 author_id_str = str(author_id).strip()
-                account_id_str = str(AVITO_ACCOUNT_ID).strip()
+                account_id_str = str(current_account_id).strip()
                 if author_id_str == account_id_str:
+                    # Это входящее сообщение от владельца аккаунта - сохраняем в историю с ролью "avito_owner"
                     logger.info(
-                        "Ignoring message from our account (author_id=%s matches account_id=%s) for chat %s",
+                        "Incoming message from account owner (author_id=%s matches account_id=%s) for chat %s - saving to history",
                         author_id_str, account_id_str, chat_id
                     )
+                    try:
+                        from utils.chat_history import save_avito_owner_message
+                        dialog_id = f"avito_{chat_id}"
+                        save_avito_owner_message(dialog_id, text)
+                        logger.info("Saved account owner message to chat history for chat %s", chat_id)
+                        
+                        # Во всех режимах бот учится и формирует FAQ из истории
+                        # Особенно важно обработать после ответа владельца (завершенный диалог)
+                        _process_dialog_for_faq_async(dialog_id)
+                    except Exception as e:
+                        logger.warning("Failed to save account owner message to chat history: %s", e)
+                    # Не генерируем ответ бота на сообщение от владельца
                     return
             
             # ФИЛЬТРАЦИЯ 5: Если нет текста - не обрабатываем (может быть системное сообщение)
             if not text or not text.strip():
-                logger.info("Empty text in webhook for chat %s, skipping (likely system message)", chat_id)
+                logger.info("⏭️ Empty text in webhook for chat %s, account_id=%s, skipping (likely system message)", 
+                           chat_id, current_account_id)
                 return
             
             # ФИЛЬТРАЦИЯ 6: Игнорируем очень короткие сообщения (вероятно, системные)
             if len(text.strip()) < 2:
-                logger.info("Ignoring very short message (length=%d) for chat %s", len(text.strip()), chat_id)
+                logger.info("⏭️ Ignoring very short message (length=%d) for chat %s, account_id=%s", 
+                           len(text.strip()), chat_id, current_account_id)
                 return
             
             # ФИЛЬТРАЦИЯ 7: Проверяем системные префиксы в тексте
@@ -879,35 +1121,68 @@ def avito_webhook() -> Response:
             ]
             text_lower = text.strip().lower()
             if any(text_lower.startswith(prefix) for prefix in system_prefixes):
-                logger.info("Ignoring message with system prefix for chat %s", chat_id)
+                logger.info("⏭️ Ignoring message with system prefix for chat %s, account_id=%s", 
+                           chat_id, current_account_id)
                 return
             
             # ФИЛЬТРАЦИЯ 8: Проверяем, что сообщение содержит реальный текст (не только специальные символы)
             # Удаляем пробелы и проверяем, остался ли текст
             text_without_spaces = text.strip().replace(" ", "").replace("\n", "").replace("\t", "")
             if len(text_without_spaces) < 2:
-                logger.info("Ignoring message with only whitespace/special chars for chat %s", chat_id)
+                logger.info("⏭️ Ignoring message with only whitespace/special chars for chat %s, account_id=%s", 
+                           chat_id, current_account_id)
+                return
+            
+            logger.info("✅ Message passed all filters: chat_id=%s, account_id=%s, text='%s'", 
+                       chat_id, current_account_id, text[:100])
+
+            # Сохраняем входящее сообщение пользователя в историю (до любых early-return)
+            dialog_id = f"avito_{chat_id}"
+            try:
+                from utils.chat_history import save_user_message, set_dialog_account_id
+                save_user_message(dialog_id, text)
+                if current_account_id:
+                    set_dialog_account_id(dialog_id, current_account_id)
+            except Exception as e:
+                logger.debug("Failed to save user message in webhook: %s", e)
+
+            # Решаем per-account: отвечать/частично/только учиться/paused
+            should_reply, effective_mode, effective_partial = _should_bot_reply_for_account(chat_id, current_account_id)
+            if not should_reply:
+                logger.info(
+                    "Not replying for chat %s (account_id=%s, mode=%s, partial=%s) - notifying manager",
+                    chat_id, current_account_id, effective_mode, effective_partial
+                )
+                await _notify_manager_for_chat(chat_id, text, data, thread_bot, account_id=current_account_id)
                 return
 
-            # Если бот должен молчать — уведомляем менеджера о ВСЕХ сообщениях
-            if not can_bot_reply(chat_id):
-                logger.info("Bot is paused for chat %s (waiting_manager or cooldown) - notifying manager", chat_id)
-                # Уведомляем менеджера о ВСЕХ сообщениях, когда бот на паузе
-                await _notify_manager_for_chat(chat_id, text, data, thread_bot)
+            # Если account_id неизвестен — отвечать технически нельзя
+            if not current_account_id:
+                logger.error("❌ account_id not resolved for chat %s - cannot send message", chat_id)
+                await _notify_manager_for_chat(chat_id, text, data, thread_bot, account_id=current_account_id)
                 return
-
-            # Проверяем конфигурацию перед отправкой
-            if not AVITO_ACCOUNT_ID:
-                logger.error("AVITO_ACCOUNT_ID not set! Cannot send message to Avito chat %s", chat_id)
-                # Уведомляем менеджера, если нет конфигурации
-                await _notify_manager_for_chat(chat_id, text, data, thread_bot)
+            cid, csec = resolve_credentials_for_account(current_account_id)
+            logger.info("🔑 Final credentials check for sending: account_id=%s, has_client_id=%s, has_client_secret=%s",
+                       current_account_id, bool(cid), bool(csec))
+            if not cid or not csec:
+                logger.error("❌ No client_id/client_secret for account_id=%s - cannot send message", current_account_id)
+                logger.error("   Установите credentials через команду /set_account_credentials %s <client_id> <client_secret>", current_account_id)
+                await _notify_manager_for_chat(chat_id, text, data, thread_bot, account_id=current_account_id)
                 return
 
             # Генерируем автоответ ЕДИНЫМ модулем и отправляем в Avito
-            logger.info("Generating auto-reply for chat %s, text_length=%d", chat_id, len(text))
+            logger.info(
+                "Generating auto-reply for chat %s, text_length=%d, mode=%s, account_id=%s",
+                chat_id, len(text), effective_mode, current_account_id
+            )
             
             try:
-                answer, meta = await generate_reply(dialog_id=f"avito_{chat_id}", incoming_text=text)
+                # Сообщение уже сохранено выше, передаем dialog_id без повторного сохранения
+                answer, meta = await generate_reply(
+                    dialog_id=dialog_id,
+                    incoming_text=text,
+                    save_user_message_to_history=False,  # уже сохранено выше в webhook
+                )
                 logger.info(
                     "generate_reply returned for chat %s: answer=%s, meta=%s",
                     chat_id,
@@ -951,11 +1226,11 @@ def avito_webhook() -> Response:
                 
                 logger.info(
                     "📤 Отправка сообщения в Avito: account_id=%s, chat_id=%s, длина ответа=%d символов",
-                    AVITO_ACCOUNT_ID, chat_id, len(answer)
+                    current_account_id, chat_id, len(answer)
                 )
                 
                 try:
-                    ok = send_message(chat_id, answer)
+                    ok = send_message(chat_id, answer, account_id=current_account_id, client_id=cid, client_secret=csec)
                     logger.info(
                         "📨 Результат отправки сообщения для чата %s: %s",
                         chat_id, "✅ Успешно" if ok else "❌ Ошибка"
@@ -988,6 +1263,9 @@ def avito_webhook() -> Response:
                         usage = meta.get("usage") if "usage" in meta else None
                         save_assistant_message(dialog_id, answer, usage)
                         logger.info("Saved chat history for dialog_id=%s (after successful send)", dialog_id)
+                        
+                        # Во всех режимах бот учится и формирует FAQ из истории
+                        _process_dialog_for_faq_async(dialog_id)
                     except Exception as e:
                         logger.warning("Failed to save chat history after sending: %s", e)
                     
@@ -1033,12 +1311,12 @@ def avito_webhook() -> Response:
             
             # Если бот сообщил, что ответит менеджер — включаем бесконечную паузу
             if meta.get("contains_signal_phrase"):
-                set_waiting_manager(chat_id)
+                set_waiting_manager(_session_key(chat_id, current_account_id))
             
             # Уведомляем менеджера если есть сигнальная фраза или произошла ошибка
             if contains_signal or meta.get("contains_signal_phrase"):
                 logger.info("Signal phrase detected in message or reply for chat %s", chat_id)
-                await _notify_manager_for_chat(chat_id, text, data, thread_bot)
+                await _notify_manager_for_chat(chat_id, text, data, thread_bot, account_id=current_account_id)
             else:
                 logger.info("No signal phrase detected, skipping manager notification for chat %s", chat_id)
         except Exception as e:
@@ -1048,6 +1326,143 @@ def avito_webhook() -> Response:
 
     run_async_in_thread(notify_and_maybe_reply())
     return jsonify({"ok": True})
+
+async def _poll_unread_chats_loop(*, interval_seconds: int = 15, webhook_grace_seconds: int = 60) -> None:
+    """
+    Fallback polling: если для аккаунта не приходят webhook, периодически проверяем unread чаты через API.
+
+    Это решает ситуацию, когда 2-й аккаунт имеет чаты/сообщения (API их видит),
+    но Avito не присылает webhook-события по нему.
+    """
+    logger.info(
+        "🛰️ Starting Avito fallback polling loop: interval=%ss, webhook_grace=%ss",
+        interval_seconds,
+        webhook_grace_seconds,
+    )
+
+    # Простейшее in-memory состояние, чтобы не дублировать обработку одного и того же last_message
+    # key = f"{account_id}:{chat_id}" -> last_message_id
+    seen_last_message: Dict[str, str] = {}
+
+    while True:
+        try:
+            accounts = list_accounts()
+            now = time.time()
+
+            for acc in accounts:
+                aid = str(acc.get("account_id") or "").strip()
+                if not aid.isdigit():
+                    continue
+
+                # Если по аккаунту недавно приходил webhook — polling не нужен (иначе будут дубли)
+                last_ts = LAST_WEBHOOK_TS_BY_ACCOUNT.get(aid)
+                if last_ts and (now - last_ts) < webhook_grace_seconds:
+                    continue
+
+                # Даже если paused/listening — всё равно “слушаем” (учимся/уведомляем), но отвечать не будем.
+                cid, csec = resolve_credentials_for_account(aid)
+                if not cid or not csec:
+                    continue
+
+                try:
+                    from avito_api import list_chats
+                    res = list_chats(
+                        limit=50,
+                        offset=0,
+                        unread_only=True,
+                        account_id=aid,
+                        client_id=cid,
+                        client_secret=csec,
+                    )
+                except Exception as e:
+                    logger.debug("Polling list_chats failed for account_id=%s: %s", aid, e)
+                    continue
+
+                chats = (res or {}).get("chats") if isinstance(res, dict) else None
+                if not isinstance(chats, list) or not chats:
+                    continue
+
+                for chat in chats:
+                    if not isinstance(chat, dict):
+                        continue
+                    chat_id = str(chat.get("id") or chat.get("chat_id") or "").strip()
+                    if not chat_id:
+                        continue
+
+                    last_msg = chat.get("last_message") if isinstance(chat.get("last_message"), dict) else None
+                    if not last_msg:
+                        continue
+
+                    # Берем только входящие текстовые сообщения
+                    if (last_msg.get("direction") or "").strip().lower() != "in":
+                        continue
+                    if (last_msg.get("type") or "").strip().lower() != "text":
+                        continue
+
+                    msg_id = str(last_msg.get("id") or "").strip()
+                    if not msg_id:
+                        continue
+
+                    state_key = f"{aid}:{chat_id}"
+                    if seen_last_message.get(state_key) == msg_id:
+                        continue
+
+                    content = last_msg.get("content") if isinstance(last_msg.get("content"), dict) else {}
+                    text = str((content or {}).get("text") or "").strip()
+                    if not text:
+                        continue
+
+                    author_id = last_msg.get("author_id")
+                    logger.info(
+                        "🛰️ Polling picked unread message: account_id=%s chat_id=%s msg_id=%s author_id=%s text_len=%d",
+                        aid,
+                        chat_id,
+                        msg_id,
+                        author_id,
+                        len(text),
+                    )
+
+                    # Обрабатываем как входящее сообщение (аналог webhook)
+                    try:
+                        dialog_id = f"avito_{chat_id}"
+                        from utils.chat_history import save_user_message, set_dialog_account_id
+
+                        save_user_message(dialog_id, text)
+                        set_dialog_account_id(dialog_id, aid)
+
+                        should_reply, effective_mode, effective_partial = _should_bot_reply_for_account(chat_id, aid)
+                        if not should_reply:
+                            logger.info(
+                                "Polling: not replying (account_id=%s, mode=%s, partial=%s) - notifying manager",
+                                aid,
+                                effective_mode,
+                                effective_partial,
+                            )
+                            await _notify_manager_for_chat(chat_id, text, {"polling": True, "last_message": last_msg}, bot, account_id=aid)
+                        else:
+                            answer, meta = await generate_reply(
+                                dialog_id=dialog_id,
+                                incoming_text=text,
+                                save_user_message_to_history=False,  # уже сохранили выше
+                            )
+                            if answer:
+                                from avito_api import send_message
+                                ok = send_message(chat_id, answer, account_id=aid, client_id=cid, client_secret=csec)
+                                if ok:
+                                    from utils.chat_history import save_assistant_message
+                                    save_assistant_message(dialog_id, answer, meta.get("usage") if isinstance(meta, dict) else None)
+                                    _process_dialog_for_faq_async(dialog_id)
+                            else:
+                                await _notify_manager_for_chat(chat_id, text, {"polling": True, "last_message": last_msg}, bot, account_id=aid)
+                    except Exception as e:
+                        logger.exception("Polling processing failed for account_id=%s chat_id=%s: %s", aid, chat_id, e)
+                    finally:
+                        seen_last_message[state_key] = msg_id
+
+        except Exception as e:
+            logger.exception("Polling loop error: %s", e)
+
+        await asyncio.sleep(max(5, int(interval_seconds)))
 
 
 # Менеджер отвечает в ТГ REPLY на уведомление (содержит Avito Chat ID)
@@ -1155,37 +1570,25 @@ async def manager_reply_handler(message: Message) -> None:
         logger.warning("⚠️ Chat ID выглядит неполным: %s (ожидается формат: u2i-...~...)", chat_id)
         logger.warning("   Попробуйте ответить на уведомление, где chat_id указан полностью")
 
-    ok = send_message(chat_id, text_to_send)
+    resolved_account_id = resolve_account_id_for_chat(chat_id)
+    cid, csec = resolve_credentials_for_account(resolved_account_id)
+    ok = send_message(chat_id, text_to_send, account_id=resolved_account_id, client_id=cid, client_secret=csec)
     if ok:
         logger.info("✅ Ответ менеджера успешно отправлен в Avito для chat_id=%s, устанавливаю cooldown", chat_id)
-        set_cooldown_after_manager(chat_id)
+        set_cooldown_after_manager(_session_key(chat_id, resolved_account_id))
         
         # Сохраняем ответ менеджера в историю
         try:
-            from responder import _load_json, _save_json, CHAT_HISTORY_PATH
-            chat_history = _load_json(CHAT_HISTORY_PATH, {})
+            from utils.chat_history import save_manager_message
             dialog_id = f"avito_{chat_id}"
-            dialog_history = chat_history.get(dialog_id, [])
-            
-            # Добавляем ответ менеджера в историю с временной меткой
-            dialog_history.append({
-                "role": "manager",
-                "content": text_to_send,
-                "timestamp": datetime.now().isoformat()
-            })
-            # Сохраняем всю историю (без ограничений)
-            chat_history[dialog_id] = dialog_history
-            _save_json(CHAT_HISTORY_PATH, chat_history)
-            
-            logger.info(
-                "Saved manager message to chat history for dialog_id=%s: %d messages",
-                dialog_id, len(chat_history[dialog_id])
-            )
+            save_manager_message(dialog_id, text_to_send)
+            logger.info("Saved manager message to chat history for dialog_id=%s", dialog_id)
+
+            # Во всех режимах бот учится и формирует базу знаний из истории
+            # Особенно важно обработать после ответа менеджера (завершенный диалог)
+            _process_dialog_for_faq_async(dialog_id)
         except Exception as e:
             logger.warning("Failed to save manager message to chat history: %s", e)
-        
-        # Автоматически добавляем ответ менеджера в FAQ
-        _add_manager_reply_to_faq(replied, text_to_send)
         
         await safe_send_message(
             message, f"✅ Ответ менеджера отправлен в Avito. Бот снова активируется через {COOLDOWN_MINUTES_AFTER_MANAGER} минут."
@@ -1197,7 +1600,9 @@ async def manager_reply_handler(message: Message) -> None:
         logger.error("   Проверьте логи avito_api.py выше для деталей ошибки")
         # Не устанавливаем cooldown, если отправка не удалась
         await safe_send_message(
-            message, f"❌ Ошибка при отправке ответа в Avito (chat_id: {chat_id}). Проверьте логи/настройки."
+            message,
+            f"❌ Ошибка при отправке ответа в Avito (chat_id: {chat_id}). "
+            f"Account ID: {resolved_account_id or 'не определён'}. Проверьте логи/настройки."
         )
 
 
@@ -1234,10 +1639,12 @@ async def manager_send_by_text(message: Message) -> None:
     if '~' not in chat_id and len(chat_id) < 25:
         logger.warning("⚠️ Chat ID выглядит неполным: %s (ожидается формат: u2i-...~...)", chat_id)
     
-    ok = send_message(chat_id, text_to_send)
+    resolved_account_id = resolve_account_id_for_chat(chat_id)
+    cid, csec = resolve_credentials_for_account(resolved_account_id)
+    ok = send_message(chat_id, text_to_send, account_id=resolved_account_id, client_id=cid, client_secret=csec)
     if ok:
         logger.info("✅ Ответ менеджера успешно отправлен в Avito для chat_id=%s, устанавливаю cooldown", chat_id)
-        set_cooldown_after_manager(chat_id)
+        set_cooldown_after_manager(_session_key(chat_id, resolved_account_id))
         
         # Сохраняем ответ менеджера в историю
         try:
@@ -1245,12 +1652,12 @@ async def manager_send_by_text(message: Message) -> None:
             dialog_id = f"avito_{chat_id}"
             save_manager_message(dialog_id, text_to_send)
             logger.info("Saved manager message to chat history for dialog_id=%s", dialog_id)
+            
+            # Во всех режимах бот учится и формирует FAQ из истории
+            # Особенно важно обработать после ответа менеджера (завершенный диалог)
+            _process_dialog_for_faq_async(dialog_id)
         except Exception as e:
             logger.warning("Failed to save manager message to chat history: %s", e)
-        
-        # Автоматически добавляем ответ менеджера в FAQ
-        # Для отправки по тексту вопрос клиента недоступен, но можно добавить только ответ
-        _add_manager_reply_to_faq_by_text(message.text or "", text_to_send)
         
         await safe_send_message(
             message, f"✅ Ответ менеджера отправлен в Avito. Бот снова активируется через {COOLDOWN_MINUTES_AFTER_MANAGER} минут."
@@ -1261,81 +1668,13 @@ async def manager_send_by_text(message: Message) -> None:
         logger.error("   Длина текста: %d символов", len(text_to_send))
         logger.error("   Проверьте логи avito_api.py выше для деталей ошибки")
         await safe_send_message(
-            message, f"❌ Ошибка при отправке ответа в Avito (chat_id: {chat_id}). Проверьте логи/настройки."
+            message,
+            f"❌ Ошибка при отправке ответа в Avito (chat_id: {chat_id}). "
+            f"Account ID: {resolved_account_id or 'не определён'}. Проверьте логи/настройки."
         )
 
 
-# Обработчик реакций на сообщения менеджера
-@dp.message_reaction()
-async def handle_manager_message_reaction(update: MessageReactionUpdated) -> None:
-    """
-    Обрабатывает реакции на сообщения менеджера.
-    
-    Если менеджер ставит 👍 на свой ответ (reply на уведомление бота),
-    обновляет source в FAQ на "manager_like".
-    
-    Args:
-        update: Обновление реакции на сообщение
-    """
-    try:
-        # Проверяем, что это реакция 👍 (thumbs up)
-        if not update.new_reaction:
-            return
-        
-        # Проверяем, что это реакция 👍
-        has_thumbs_up = False
-        for reaction in update.new_reaction:
-            # Проверяем различные варианты эмодзи 👍
-            if hasattr(reaction, 'emoji') and reaction.emoji in ['👍', '👍🏻', '👍🏼', '👍🏽', '👍🏾', '👍🏿']:
-                has_thumbs_up = True
-                break
-            # Также проверяем тип реакции (если используется ReactionType)
-            if hasattr(reaction, 'type') and hasattr(reaction.type, 'emoji'):
-                if reaction.type.emoji in ['👍', '👍🏻', '👍🏼', '👍🏽', '👍🏾', '👍🏿']:
-                    has_thumbs_up = True
-                    break
-        
-        if not has_thumbs_up:
-            return
-        
-        # Получаем ID сообщения, на которое поставлена реакция
-        message_id = update.message_id
-        chat_id = update.chat.id
-        user_id = update.user.id if update.user else None
-        
-        logger.info("Получена реакция 👍 на сообщение message_id=%s в чате %s от пользователя %s", 
-                   message_id, chat_id, user_id)
-        
-        # Загружаем FAQ и ищем запись с этим message_id
-        try:
-            with open(FAQ_PATH, "r", encoding="utf-8") as f:
-                current_faq = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            logger.warning("Не удалось загрузить FAQ для обновления source")
-            return
-        
-        # Ищем запись по последнему сообщению менеджера с source="manager" или "user_like"
-        # Поскольку manager_message_id больше не сохраняется, ищем последнюю запись от менеджера или user_like
-        updated = False
-        # Ищем последнюю запись с source="manager" или "user_like" (предполагаем, что это последний ответ)
-        for item in reversed(current_faq):
-            source = item.get("source", "")
-            if source == "manager" or source == "user_like":
-                item["source"] = "manager_like"
-                updated = True
-                logger.info("✅ Обновлен source на 'manager_like' для записи (было: '%s', message_id=%s)", source, message_id)
-                break
-        
-        if updated:
-            # Сохраняем обновленный FAQ
-            os.makedirs(os.path.dirname(FAQ_PATH), exist_ok=True)
-            with open(FAQ_PATH, "w", encoding="utf-8") as f:
-                json.dump(current_faq, f, ensure_ascii=False, indent=2)
-        else:
-            logger.debug("Не найдена запись в FAQ для обновления source (message_id=%s)", message_id)
-            
-    except Exception as e:
-        logger.exception("Ошибка при обработке реакции на сообщение менеджера: %s", e)
+## Реакции 👍/👎 убраны: обучение идет через историю диалогов и knowledge cards.
 
 
 def run_flask() -> None:
@@ -1353,6 +1692,28 @@ async def run_bot() -> None:
     except Exception as e:
         logger.warning("Не удалось установить меню бота при запуске: %s", e)
     
+    # Обрабатываем старые диалоги для формирования FAQ при старте
+    # При старте обрабатываем все необработанные диалоги, независимо от возраста
+    try:
+        from utils.faq_from_history import process_all_dialogs_for_faq
+        from responder import client as llm_client
+        
+        logger.info("Начинаю обработку старых диалогов для формирования FAQ при старте...")
+        # При старте обрабатываем все необработанные диалоги (min_dialog_age_minutes=0)
+        stats = await process_all_dialogs_for_faq(llm_client, min_dialog_age_minutes=0)
+        logger.info(
+            "✅ Обработка старых диалогов завершена: обработано=%d, добавлено/обновлено knowledge cards=%d",
+            stats.get("processed", 0), stats.get("added", 0)
+        )
+    except Exception as e:
+        logger.warning("Не удалось обработать старые диалоги при старте: %s", e)
+    
+    # Fallback polling (если webhook по аккаунту не приходит)
+    try:
+        asyncio.create_task(_poll_unread_chats_loop())
+    except Exception as e:
+        logger.warning("Failed to start fallback polling loop: %s", e)
+
     await dp.start_polling(bot)
 
 

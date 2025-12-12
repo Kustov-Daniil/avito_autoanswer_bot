@@ -124,6 +124,9 @@ TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.2"))
 # Менеджерская логика
 COOLDOWN_MINUTES_AFTER_MANAGER: int = int(os.getenv("COOLDOWN_MINUTES_AFTER_MANAGER", "15"))
 
+# FAQ из истории
+MIN_DIALOG_AGE_MINUTES: int = int(os.getenv("MIN_DIALOG_AGE_MINUTES", "5"))  # Минимальный возраст диалога в минутах для обработки FAQ
+
 # Экономические метрики
 MANAGER_COST_PER_HOUR: float = float(os.getenv("MANAGER_COST_PER_HOUR", "1000"))  # Стоимость менеджера в рублях за час
 USD_RATE: float = float(os.getenv("USD_RATE", "100"))  # Курс доллара к рублю
@@ -140,6 +143,8 @@ SIGNAL_PHRASES: List[str] = [
 # Пути к файлам данных
 DATA_DIR: str = "data"
 FAQ_PATH: str = os.path.join(DATA_DIR, "faq.json")
+KNOWLEDGE_CARDS_PATH: str = os.path.join(DATA_DIR, "knowledge_cards.json")
+AVITO_ACCOUNTS_PATH: str = os.path.join(DATA_DIR, "avito_accounts.json")
 STATIC_CONTEXT_PATH: str = os.path.join(DATA_DIR, "static_context.txt")
 DYNAMIC_CONTEXT_PATH: str = os.path.join(DATA_DIR, "dynamic_context.txt")
 SYSTEM_PROMPT_PATH: str = os.path.join(DATA_DIR, "system_prompt.txt")

@@ -305,3 +305,170 @@ def calculate_stats() -> Dict[str, Any]:
         "net_savings_rub": net_savings_rub
     }
 
+
+def calculate_account_stats(account_id: str) -> Dict[str, Any]:
+    """
+    Статистика по конкретному Avito account_id (multi-account).
+
+    Привязка диалогов к account_id берется из chat_history.json["_meta"][dialog_id]["account_id"].
+    """
+    account_id = (str(account_id).strip() if account_id is not None else "")
+    if not account_id:
+        return {"error": "account_id is empty"}
+
+    try:
+        chat_history = _load_json(CHAT_HISTORY_PATH, {})
+    except Exception as e:
+        logger.exception("Ошибка при загрузке chat_history для статистики: %s", e)
+        chat_history = {}
+
+    meta_root = chat_history.get("_meta") if isinstance(chat_history, dict) else {}
+    if not isinstance(meta_root, dict):
+        meta_root = {}
+
+    # Загружаем FAQ для экономических метрик (нужно только для подсчёта количества FAQ; оставим как в общей статистике)
+    try:
+        faq_data, _ = load_faq_safe()
+        if not isinstance(faq_data, list):
+            faq_data = []
+    except Exception:
+        faq_data = []
+
+    total_chats = 0
+    total_bot_responses = 0
+    total_manager_responses = 0
+    manager_transfers = 0
+
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_tokens = 0
+    total_cost_usd = 0.0
+
+    manager_response_times: List[float] = []
+    manager_signal_phrase = "Подождите, пожалуйста, уточняю информацию"
+
+    last_activity_ts: str = ""
+
+    for dialog_id, messages in chat_history.items():
+        if dialog_id == "_meta":
+            continue
+        if not isinstance(dialog_id, str) or not dialog_id.startswith("avito_"):
+            continue
+        if not isinstance(messages, list):
+            continue
+
+        meta = meta_root.get(dialog_id) or {}
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("account_id") or "").strip() != account_id:
+            continue
+
+        bot_responses_in_chat = 0
+        manager_responses_in_chat = 0
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "")
+            content = (msg.get("content", "") or "").strip()
+            ts = msg.get("timestamp")
+            if isinstance(ts, str) and ts > last_activity_ts:
+                last_activity_ts = ts
+
+            if role == "assistant" and content:
+                bot_responses_in_chat += 1
+                total_bot_responses += 1
+
+                usage = msg.get("usage", {})
+                if isinstance(usage, dict):
+                    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+                    model = usage.get("model", "gpt-4o")
+                    if prompt_tokens > 0 or completion_tokens > 0:
+                        total_prompt_tokens += prompt_tokens
+                        total_completion_tokens += completion_tokens
+                        total_tokens += prompt_tokens + completion_tokens
+                        total_cost_usd += calculate_token_cost(model, prompt_tokens, completion_tokens)
+
+                content_lower = content.lower()
+                is_manager_transfer = (
+                    manager_signal_phrase.lower() in content_lower or
+                    any(phrase.lower() in content_lower for phrase in SIGNAL_PHRASES)
+                )
+                if is_manager_transfer:
+                    manager_transfers += 1
+
+            elif role == "manager" and content:
+                manager_responses_in_chat += 1
+                total_manager_responses += 1
+
+                manager_timestamp = msg.get("timestamp")
+                if manager_timestamp:
+                    try:
+                        manager_time = datetime.fromisoformat(manager_timestamp)
+                        msg_index = messages.index(msg)
+                        for prev_msg in reversed(messages[:msg_index]):
+                            if isinstance(prev_msg, dict):
+                                prev_role = prev_msg.get("role", "")
+                                prev_timestamp = prev_msg.get("timestamp")
+                                if prev_timestamp and prev_role in ["user", "assistant"]:
+                                    try:
+                                        prev_time = datetime.fromisoformat(prev_timestamp)
+                                        dt_s = (manager_time - prev_time).total_seconds()
+                                        if 0 < dt_s < 86400:
+                                            manager_response_times.append(dt_s)
+                                        break
+                                    except (ValueError, TypeError):
+                                        continue
+                    except (ValueError, TypeError):
+                        pass
+
+        if bot_responses_in_chat > 0 or manager_responses_in_chat > 0:
+            total_chats += 1
+
+    total_responses = total_bot_responses + total_manager_responses
+    bot_response_rate = (total_bot_responses / total_responses * 100) if total_responses > 0 else 0.0
+    manager_response_rate = (total_manager_responses / total_responses * 100) if total_responses > 0 else 0.0
+    manager_transfer_rate = (manager_transfers / total_bot_responses * 100) if total_bot_responses > 0 else 0.0
+
+    avg_manager_response_time_seconds = 0.0
+    if manager_response_times:
+        avg_manager_response_time_seconds = sum(manager_response_times) / len(manager_response_times)
+    avg_manager_response_time_hours = avg_manager_response_time_seconds / 3600
+
+    total_cost_rub = total_cost_usd * USD_RATE
+    bot_responses_without_transfer = total_bot_responses - manager_transfers
+    saved_time_hours = bot_responses_without_transfer * avg_manager_response_time_hours if avg_manager_response_time_hours > 0 else 0.0
+    saved_money_rub = saved_time_hours * MANAGER_COST_PER_HOUR
+    net_savings_rub = saved_money_rub - total_cost_rub
+
+    faq_total = 0
+    if isinstance(faq_data, list):
+        for item in faq_data:
+            if isinstance(item, dict):
+                faq_total += 1
+
+    return {
+        "account_id": account_id,
+        "total_chats": total_chats,
+        "total_bot_responses": total_bot_responses,
+        "total_manager_responses": total_manager_responses,
+        "total_responses": total_responses,
+        "bot_response_rate": bot_response_rate,
+        "manager_response_rate": manager_response_rate,
+        "manager_transfers": manager_transfers,
+        "manager_transfer_rate": manager_transfer_rate,
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_completion_tokens": total_completion_tokens,
+        "total_tokens": total_tokens,
+        "total_cost_usd": total_cost_usd,
+        "total_cost_rub": total_cost_rub,
+        "avg_manager_response_time_seconds": avg_manager_response_time_seconds,
+        "avg_manager_response_time_hours": avg_manager_response_time_hours,
+        "saved_time_hours": saved_time_hours,
+        "saved_money_rub": saved_money_rub,
+        "net_savings_rub": net_savings_rub,
+        "last_activity_ts": last_activity_ts,
+        "faq_total": faq_total,
+    }
+

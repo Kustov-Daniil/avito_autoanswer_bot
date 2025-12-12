@@ -182,3 +182,4 @@ cv_processing.db
 data/
 .DS_Store
 *.DS_Store
+avito_accounts.json

@@ -21,25 +21,41 @@ SESSION_STATE_COOLDOWN: str = "cooldown"
 # In-memory storage (для production можно заменить на Redis/БД)
 _sessions: Dict[str, Dict[str, Any]] = {}  # chat_id -> {"state": str, "until": Optional[datetime]}
 
-# Глобальное состояние бота (ON/OFF)
+# Режимы работы бота
+BOT_MODE_LISTENING: str = "listening"  # Только слушает, формирует FAQ
+BOT_MODE_PARTIAL: str = "partial"      # Отвечает на часть сообщений (процент)
+BOT_MODE_FULL: str = "full"            # Отвечает всем (полный режим)
+
+# Глобальное состояние бота
 _bot_enabled: bool = True
+_bot_mode: str = BOT_MODE_FULL  # Режим работы бота
+_partial_percentage: int = 50   # Процент сообщений для режима partial (0-100)
 
 
 def _load_bot_state() -> bool:
     """Загружает состояние бота из файла."""
-    global _bot_enabled
+    global _bot_enabled, _bot_mode, _partial_percentage
     try:
         if os.path.exists(BOT_STATE_PATH):
             with open(BOT_STATE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 _bot_enabled = data.get("enabled", True)
-                logger.info("Загружено состояние бота из файла: %s", "ON" if _bot_enabled else "OFF")
+                _bot_mode = data.get("mode", BOT_MODE_FULL)
+                _partial_percentage = data.get("partial_percentage", 50)
+                logger.info(
+                    "Загружено состояние бота из файла: enabled=%s, mode=%s, partial_percentage=%d",
+                    "ON" if _bot_enabled else "OFF", _bot_mode, _partial_percentage
+                )
         else:
             _bot_enabled = True
+            _bot_mode = BOT_MODE_FULL
+            _partial_percentage = 50
             _save_bot_state()
     except Exception as e:
-        logger.warning("Не удалось загрузить состояние бота: %s, используем значение по умолчанию (ON)", e)
+        logger.warning("Не удалось загрузить состояние бота: %s, используем значения по умолчанию", e)
         _bot_enabled = True
+        _bot_mode = BOT_MODE_FULL
+        _partial_percentage = 50
     return _bot_enabled
 
 
@@ -102,8 +118,10 @@ def _save_bot_state() -> None:
             with open(BOT_STATE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
         
-        # Обновляем только enabled
+        # Обновляем состояние бота
         data["enabled"] = _bot_enabled
+        data["mode"] = _bot_mode
+        data["partial_percentage"] = _partial_percentage
         
         os.makedirs(os.path.dirname(BOT_STATE_PATH), exist_ok=True)
         with open(BOT_STATE_PATH, "w", encoding="utf-8") as f:
@@ -246,3 +264,96 @@ def get_session_info(chat_id: str) -> Optional[Dict[str, Any]]:
         Словарь с информацией о сессии или None
     """
     return _sessions.get(chat_id)
+
+
+def get_bot_mode() -> str:
+    """
+    Получает текущий режим работы бота.
+    
+    Returns:
+        Режим работы бота: "listening", "partial" или "full"
+    """
+    return _bot_mode
+
+
+def set_bot_mode(mode: str) -> None:
+    """
+    Устанавливает режим работы бота.
+    
+    Args:
+        mode: Режим работы ("listening", "partial" или "full")
+    """
+    global _bot_mode
+    if mode not in [BOT_MODE_LISTENING, BOT_MODE_PARTIAL, BOT_MODE_FULL]:
+        logger.warning("Неизвестный режим бота: %s, используем 'full'", mode)
+        mode = BOT_MODE_FULL
+    
+    _bot_mode = mode
+    _save_bot_state()
+    logger.info("Режим работы бота изменен: %s", mode)
+
+
+def get_partial_percentage() -> int:
+    """
+    Получает процент сообщений для режима partial.
+    
+    Returns:
+        Процент сообщений (0-100)
+    """
+    return _partial_percentage
+
+
+def set_partial_percentage(percentage: int) -> None:
+    """
+    Устанавливает процент сообщений для режима partial.
+    
+    Args:
+        percentage: Процент сообщений (0-100)
+    """
+    global _partial_percentage
+    if percentage < 0:
+        percentage = 0
+    elif percentage > 100:
+        percentage = 100
+    
+    _partial_percentage = percentage
+    _save_bot_state()
+    logger.info("Процент сообщений для режима partial установлен: %d%%", percentage)
+
+
+def should_bot_reply(chat_id: str) -> bool:
+    """
+    Проверяет, должен ли бот отвечать на сообщение в указанном чате.
+    Учитывает режим работы бота и процент для partial режима.
+    
+    Args:
+        chat_id: ID чата в Avito
+        
+    Returns:
+        True если бот должен отвечать, False если только слушать
+    """
+    # Если бот выключен - не отвечаем
+    if not is_bot_enabled():
+        return False
+    
+    # В режиме listening - только слушаем, не отвечаем
+    if _bot_mode == BOT_MODE_LISTENING:
+        return False
+    
+    # В режиме full - проверяем стандартные ограничения (cooldown, waiting_manager)
+    if _bot_mode == BOT_MODE_FULL:
+        return can_bot_reply(chat_id)
+    
+    # В режиме partial - проверяем процент и стандартные ограничения
+    if _bot_mode == BOT_MODE_PARTIAL:
+        if not can_bot_reply(chat_id):
+            return False
+        
+        # Используем hash от chat_id для детерминированного выбора
+        # Это гарантирует, что для одного чата решение будет одинаковым
+        import hashlib
+        chat_hash = int(hashlib.md5(chat_id.encode()).hexdigest(), 16)
+        should_reply = (chat_hash % 100) < _partial_percentage
+        return should_reply
+    
+    return False
