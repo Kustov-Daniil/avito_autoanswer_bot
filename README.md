@@ -14,7 +14,6 @@
 - 💬 **Telegram бот** для управления и ответов менеджеров
 - 🔄 **Умная логика пауз**: бот автоматически останавливается при передаче менеджеру
 - ⏱️ **Cooldown после ответа менеджера**: бот не отвечает 15 минут после ответа менеджера
-- 📊 **Система обратной связи**: пользователи могут оценивать ответы (👍 👎)
 - 🎯 **Приоритизация источников знаний** - четкая иерархия источников информации
 
 ## Архитектура
@@ -53,10 +52,10 @@ cp .env.example .env
 
 Обязательные переменные:
 - `TELEGRAM_BOT_TOKEN` - токен Telegram бота (получить у @BotFather)
-- `TELEGRAM_MANAGER_ID` - ваш Telegram user ID (для получения уведомлений)
-- `AVITO_CLIENT_ID` - ID приложения Avito
-- `AVITO_CLIENT_SECRET` - секрет приложения Avito
+- `MANAGERS` - Telegram user ID менеджеров (через запятую), кому слать уведомления
 - `AVITO_ACCOUNT_ID` - ID аккаунта компании в Avito (числовой ID)
+- `AVITO_CLIENT_ID` / `AVITO_CLIENT_SECRET` - credentials приложения Avito (если один набор на все аккаунты)
+- `AVITO_ACCOUNTS_CREDENTIALS_JSON` - (рекомендуется) per-account credentials в виде JSON в env
 - `OPENAI_API_KEY` - ключ API OpenAI
 
 Опциональные переменные:
@@ -65,6 +64,9 @@ cp .env.example .env
 - `COOLDOWN_MINUTES_AFTER_MANAGER` - пауза после ответа менеджера (по умолчанию: `15`)
 - `ADMINS` - список ID администраторов через запятую
 - `PUBLIC_BASE_URL` - публичный URL для webhook (например, `https://your-domain.com`)
+- `LOG_LEVEL` - уровень логирования (DEBUG/INFO/WARNING/ERROR)
+- `LOG_PII` - логировать ли тексты/истории (0/1). По умолчанию 0 (privacy).
+- `LOG_WEBHOOK_PAYLOAD` - логировать ли raw webhook payload (0/1). По умолчанию 0 (privacy).
 
 ### 3. Запуск бота
 
@@ -126,9 +128,13 @@ avito_autoanswer_bot/
 ### Telegram бот
 
 **Команды для пользователей:**
-- `/start` - приветствие и описание возможностей
+- `/start` - приветствие
+- `/help` - справка
+- `/reset` - сбросить контекст (историю) для этого чата
 
 **Команды для администраторов:**
+- `/status` или `/botstatus` - управление ботом (on/off, режимы, модель)
+- `/accounts` - Avito аккаунты (multi-account)
 - `/knowledge` или `/kb` - управление базой знаний
   - Добавление знаний из текста
   - Загрузка файлов с переписками
@@ -394,3 +400,6 @@ chmod +x setup_webhook.sh
 ## Автор
 
 [Укажите автора]
+
+
+Добавлен новый менеджер.

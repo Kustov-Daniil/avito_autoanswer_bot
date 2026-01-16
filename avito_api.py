@@ -7,6 +7,7 @@ API клиент для работы с Avito Messenger API.
 - Отправка сообщений в чаты
 - Работа с чатами и сообщениями
 """
+import os
 import requests
 import time
 import logging
@@ -14,6 +15,30 @@ from typing import Optional, Dict, Any, List, Tuple
 from config import AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_ACCOUNT_ID
 
 logger = logging.getLogger(__name__)
+
+# Общая HTTP-сессия + ретраи (устойчивость к 429/5xx/флапающим сетям)
+#
+# ВАЖНО:
+# - Таймауты задаются на уровне вызова (timeout=...)
+# - Ретраи здесь НЕ “бесконечные”: ограничены, с backoff
+try:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    _RETRY = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+        raise_on_status=False,
+    )
+    _HTTP = requests.Session()
+    _HTTP.mount("https://", HTTPAdapter(max_retries=_RETRY))
+    _HTTP.mount("http://", HTTPAdapter(max_retries=_RETRY))
+except Exception:  # pragma: no cover
+    _HTTP = requests
 
 # API endpoints
 TOKEN_URL: str = "https://api.avito.ru/token"
@@ -66,7 +91,7 @@ def _refresh_token(*, client_id: Optional[str] = None, client_secret: Optional[s
     }
     
     try:
-        r = requests.post(TOKEN_URL, data=data, timeout=TOKEN_REFRESH_TIMEOUT)
+        r = _HTTP.post(TOKEN_URL, data=data, timeout=TOKEN_REFRESH_TIMEOUT)
         r.raise_for_status()
         j = r.json()
         access_token = j.get("access_token")
@@ -150,7 +175,7 @@ def subscribe_webhook(url_to_send: str, *, client_id: Optional[str] = None, clie
         return False
     
     try:
-        r = requests.post(
+        r = _HTTP.post(
             WEBHOOK_V3,
             headers={**_headers(client_id=client_id, client_secret=client_secret), "Content-Type": "application/json"},
             json={"url": url_to_send},
@@ -177,7 +202,7 @@ def get_subscriptions(*, client_id: Optional[str] = None, client_secret: Optiona
         requests.RequestException: При ошибке запроса к API
     """
     url = "https://api.avito.ru/messenger/v1/subscriptions"
-    r = requests.post(url, headers=_headers(client_id=client_id, client_secret=client_secret), timeout=WEBHOOK_TIMEOUT)
+    r = _HTTP.post(url, headers=_headers(client_id=client_id, client_secret=client_secret), timeout=WEBHOOK_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -198,7 +223,7 @@ def unsubscribe_webhook(url_to_stop: str, *, client_id: Optional[str] = None, cl
     
     url = "https://api.avito.ru/messenger/v1/webhook/unsubscribe"
     try:
-        r = requests.post(
+        r = _HTTP.post(
             url,
             headers={**_headers(client_id=client_id, client_secret=client_secret), "Content-Type": "application/json"},
             json={"url": url_to_stop},
@@ -301,7 +326,7 @@ def send_text_message(
         logger.debug("Request URL: %s", url)
         logger.debug("Request payload: %s", payload)
         
-        r = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+        r = _HTTP.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
         
         logger.info("Avito API response: status_code=%s, chat_id=%s", r.status_code, chat_id)
         
@@ -506,7 +531,7 @@ def upload_image(
     try:
         with open(filepath, "rb") as f:
             files = {"uploadfile[]": f}
-            r = requests.post(url, headers=_headers(client_id=client_id, client_secret=client_secret), files=files, timeout=IMAGE_UPLOAD_TIMEOUT)
+            r = _HTTP.post(url, headers=_headers(client_id=client_id, client_secret=client_secret), files=files, timeout=IMAGE_UPLOAD_TIMEOUT)
         
         if r.status_code in (200, 201):
             data = r.json()
@@ -551,7 +576,7 @@ def send_image_message(
     url = f"{API_BASE_V1}/{resolved_account_id}/chats/{chat_id}/messages/image"
     
     try:
-        r = requests.post(
+        r = _HTTP.post(
             url,
             headers={**_headers(client_id=client_id, client_secret=client_secret), "Content-Type": "application/json"},
             json={"image_id": image_id},
@@ -597,7 +622,7 @@ def delete_message(
     url = f"{API_BASE_V1}/{resolved_account_id}/chats/{chat_id}/messages/{message_id}"
     
     try:
-        r = requests.post(url, headers=_headers(client_id=client_id, client_secret=client_secret), timeout=REQUEST_TIMEOUT)
+        r = _HTTP.post(url, headers=_headers(client_id=client_id, client_secret=client_secret), timeout=REQUEST_TIMEOUT)
         if r.status_code in (200, 204):
             logger.info("Message deleted successfully: chat_id=%s, message_id=%s", chat_id, message_id)
             return True
@@ -630,7 +655,7 @@ def mark_chat_read(chat_id: str, *, account_id: Optional[str] = None, client_id:
     url = f"{API_BASE_V1}/{resolved_account_id}/chats/{chat_id}/read"
     
     try:
-        r = requests.post(url, headers=_headers(client_id=client_id, client_secret=client_secret), timeout=WEBHOOK_TIMEOUT)
+        r = _HTTP.post(url, headers=_headers(client_id=client_id, client_secret=client_secret), timeout=WEBHOOK_TIMEOUT)
         if r.status_code in (200, 204):
             logger.info("Chat marked as read: chat_id=%s", chat_id)
             return True
@@ -682,7 +707,7 @@ def list_chats(
         params["chat_types"] = ",".join(chat_types)
     
     try:
-        r = requests.get(url, headers=_headers(client_id=client_id, client_secret=client_secret), params=params, timeout=REQUEST_TIMEOUT)
+        r = _HTTP.get(url, headers=_headers(client_id=client_id, client_secret=client_secret), params=params, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return r.json()
     except requests.exceptions.HTTPError as e:
@@ -719,7 +744,7 @@ def get_chat(chat_id: str, *, account_id: Optional[str] = None, client_id: Optio
     url = f"{API_BASE_V2}/{resolved_account_id}/chats/{chat_id}"
     
     try:
-        r = requests.get(url, headers=_headers(client_id=client_id, client_secret=client_secret), timeout=REQUEST_TIMEOUT)
+        r = _HTTP.get(url, headers=_headers(client_id=client_id, client_secret=client_secret), timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return r.json()
     except requests.exceptions.HTTPError as e:
@@ -774,7 +799,7 @@ def list_messages_v3(
     }
     
     try:
-        r = requests.get(url, headers=_headers(client_id=client_id, client_secret=client_secret), params=params, timeout=REQUEST_TIMEOUT)
+        r = _HTTP.get(url, headers=_headers(client_id=client_id, client_secret=client_secret), params=params, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         j = r.json()
         return j if isinstance(j, list) else []

@@ -26,8 +26,8 @@ if not OPENAI_API_KEY:
     client = None
 else:
     try:
-        http_client = httpx.AsyncClient()
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+        http_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY, http_client=http_client, max_retries=3)
         logger.info("OpenAI client initialized for knowledge extraction")
     except Exception as e:
         logger.exception("Failed to initialize OpenAI client: %s", e)

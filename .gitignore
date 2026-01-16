@@ -115,7 +115,6 @@ env.bak/
 venv.bak/
 .pdm*
 pdm*
-pyproject.toml
 
 # Spyder project settings
 .spyderproject
@@ -183,3 +182,10 @@ data/
 .DS_Store
 *.DS_Store
 avito_accounts.json
+
+# Runtime logs/state for this bot
+data/logs/
+data/*.log
+data/*.log.*
+data/*.backup
+data/avito_credentials.json

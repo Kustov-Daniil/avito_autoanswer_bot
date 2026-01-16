@@ -6,8 +6,6 @@
   {
     "account_id": "123456",
     "name": "VisaWay Pro (опционально)",
-    "client_id": "....",
-    "client_secret": "....",
     "paused": false,
     "mode": "full",
     "partial_percentage": 50,
@@ -17,6 +15,10 @@
 ]
 
 Paused означает: бот НЕ отвечает за этот аккаунт, но продолжает слушать и учиться (chat_history → knowledge cards).
+
+ВАЖНО ПО БЕЗОПАСНОСТИ:
+- Секреты (client_id/client_secret) НЕ храним в JSON/репозитории.
+- Credentials берём ТОЛЬКО из переменных окружения (.env) через `config.get_avito_credentials()`.
 """
 
 from __future__ import annotations
@@ -27,14 +29,15 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import AVITO_ACCOUNTS_PATH, AVITO_ACCOUNT_ID, DATA_DIR
+from config import AVITO_ACCOUNTS_PATH, AVITO_ACCOUNT_ID, DATA_DIR, AVITO_CREDENTIALS_STORE_PATH
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODE: str = "full"  # listening | partial | full
 DEFAULT_PARTIAL_PERCENTAGE: int = 50
-DEFAULT_CLIENT_ID: str = ""
-DEFAULT_CLIENT_SECRET: str = ""
+
+# legacy-поля, которые могли быть записаны раньше (до выноса секретов в .env)
+_LEGACY_SECRET_FIELDS: tuple[str, ...] = ("client_id", "client_secret")
 
 
 def _now_iso() -> str:
@@ -89,8 +92,6 @@ def ensure_accounts_store_initialized() -> None:
                 {
                     "account_id": default_id,
                     "name": "default",
-                    "client_id": DEFAULT_CLIENT_ID,
-                    "client_secret": DEFAULT_CLIENT_SECRET,
                     "paused": False,
                     "mode": DEFAULT_MODE,
                     "partial_percentage": DEFAULT_PARTIAL_PERCENTAGE,
@@ -111,12 +112,6 @@ def ensure_accounts_store_initialized() -> None:
                     if "partial_percentage" not in x:
                         x["partial_percentage"] = DEFAULT_PARTIAL_PERCENTAGE
                         changed = True
-                    if "client_id" not in x:
-                        x["client_id"] = DEFAULT_CLIENT_ID
-                        changed = True
-                    if "client_secret" not in x:
-                        x["client_secret"] = DEFAULT_CLIENT_SECRET
-                        changed = True
                     if "paused" not in x:
                         x["paused"] = False
                         changed = True
@@ -125,6 +120,14 @@ def ensure_accounts_store_initialized() -> None:
                         changed = True
                     if changed:
                         x["updated_at"] = _now_iso()
+
+    # Чистим legacy секреты из файла, если они там внезапно оказались
+    for x in data:
+        if isinstance(x, dict):
+            for k in _LEGACY_SECRET_FIELDS:
+                if k in x:
+                    x.pop(k, None)
+                    changed = True
 
     if not file_exists or changed:
         _safe_save_json(AVITO_ACCOUNTS_PATH, data)
@@ -138,10 +141,13 @@ def list_accounts() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for item in data:
         if isinstance(item, dict) and normalize_account_id(item.get("account_id")):
+            # Удаляем legacy секреты, если они были записаны в старых версиях
+            for k in _LEGACY_SECRET_FIELDS:
+                if k in item:
+                    item.pop(k, None)
+
             # Нормализуем недостающие поля для обратной совместимости
             item.setdefault("name", "")
-            item.setdefault("client_id", DEFAULT_CLIENT_ID)
-            item.setdefault("client_secret", DEFAULT_CLIENT_SECRET)
             item.setdefault("paused", False)
             item.setdefault("mode", DEFAULT_MODE)
             item.setdefault("partial_percentage", DEFAULT_PARTIAL_PERCENTAGE)
@@ -166,8 +172,6 @@ def upsert_account(
     *,
     name: Optional[str] = None,
     paused: Optional[bool] = None,
-    client_id: Optional[str] = None,
-    client_secret: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
     Создаёт аккаунт или обновляет его поля (name/paused).
@@ -188,14 +192,8 @@ def upsert_account(
         if normalize_account_id(item.get("account_id")) == aid:
             if name is not None:
                 item["name"] = str(name).strip()
-            if client_id is not None:
-                item["client_id"] = str(client_id).strip()
-            if client_secret is not None:
-                item["client_secret"] = str(client_secret).strip()
             if paused is not None:
                 item["paused"] = bool(paused)
-            item.setdefault("client_id", DEFAULT_CLIENT_ID)
-            item.setdefault("client_secret", DEFAULT_CLIENT_SECRET)
             item.setdefault("mode", DEFAULT_MODE)
             item.setdefault("partial_percentage", DEFAULT_PARTIAL_PERCENTAGE)
             item["updated_at"] = now
@@ -206,8 +204,6 @@ def upsert_account(
         {
             "account_id": aid,
             "name": (str(name).strip() if name else ""),
-            "client_id": (str(client_id).strip() if client_id else ""),
-            "client_secret": (str(client_secret).strip() if client_secret else ""),
             "paused": bool(paused) if paused is not None else False,
             "mode": DEFAULT_MODE,
             "partial_percentage": DEFAULT_PARTIAL_PERCENTAGE,
@@ -258,8 +254,6 @@ def set_mode(account_id: str, mode: str, *, partial_percentage: Optional[int] = 
                 item.setdefault("partial_percentage", DEFAULT_PARTIAL_PERCENTAGE)
             item.setdefault("paused", False)
             item.setdefault("name", "")
-            item.setdefault("client_id", DEFAULT_CLIENT_ID)
-            item.setdefault("client_secret", DEFAULT_CLIENT_SECRET)
             item["updated_at"] = now
             _safe_save_json(AVITO_ACCOUNTS_PATH, data)
             return True, "Режим аккаунта обновлён."
@@ -276,8 +270,6 @@ def set_mode(account_id: str, mode: str, *, partial_percentage: Optional[int] = 
         {
             "account_id": aid,
             "name": "",
-            "client_id": "",
-            "client_secret": "",
             "paused": True,
             "mode": mode,
             "partial_percentage": p,
@@ -295,29 +287,31 @@ def set_paused(account_id: str, paused: bool) -> Tuple[bool, str]:
 
 def get_account_credentials(account_id: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Возвращает (client_id, client_secret) для аккаунта, если они заполнены.
+    Возвращает (client_id, client_secret) для account_id из .env (секреты не храним в JSON).
     """
     aid = normalize_account_id(account_id)
     if not aid:
         logger.debug("get_account_credentials: invalid account_id=%s", account_id)
         return None, None
-    acc = get_account(aid)
-    if not acc:
-        logger.debug("get_account_credentials: account not found for account_id=%s", aid)
+    try:
+        from config import get_avito_credentials
+
+        cid, csec = get_avito_credentials(aid)
+        if not cid or not csec:
+            return None, None
+        return cid, csec
+    except Exception:
         return None, None
-    cid = str(acc.get("client_id") or "").strip()
-    csec = str(acc.get("client_secret") or "").strip()
-    if not cid or not csec:
-        logger.debug("get_account_credentials: empty credentials for account_id=%s (client_id=%s, client_secret=%s)",
-                    aid, "set" if cid else "empty", "set" if csec else "empty")
-        return None, None
-    logger.debug("get_account_credentials: found credentials for account_id=%s", aid)
-    return cid, csec
 
 
 def set_account_credentials(account_id: str, client_id: str, client_secret: str) -> Tuple[bool, str]:
     """
-    Устанавливает client_id/client_secret для аккаунта.
+    Устанавливает client_id/client_secret для аккаунта через Telegram.
+
+    Безопасность:
+    - Секреты НЕ пишутся в avito_accounts.json
+    - Сохраняются в локальный файл `data/avito_credentials.json` (должен быть в .gitignore)
+    - Работает без рестарта: `config.get_avito_credentials()` читает этот файл при каждом запросе
     """
     aid = normalize_account_id(account_id)
     if not aid:
@@ -326,7 +320,44 @@ def set_account_credentials(account_id: str, client_id: str, client_secret: str)
     csec = (str(client_secret or "").strip())
     if not cid or not csec:
         return False, "client_id/client_secret не должны быть пустыми."
-    return upsert_account(aid, client_id=cid, client_secret=csec)
+    try:
+        store_path = str(AVITO_CREDENTIALS_STORE_PATH or "").strip() or os.path.join(DATA_DIR, "avito_credentials.json")
+        os.makedirs(os.path.dirname(store_path) or ".", exist_ok=True)
+        data = _safe_load_json(store_path, {})
+        if not isinstance(data, dict):
+            data = {}
+        data[aid] = {
+            "client_id": cid,
+            "client_secret": csec,
+            "updated_at": _now_iso(),
+        }
+        _safe_save_json(store_path, data)
+        return True, "Credentials сохранены локально (data/avito_credentials.json)."
+    except Exception as e:
+        logger.exception("Failed to save avito credentials for account_id=%s: %s", aid, e)
+        return False, "Не удалось сохранить credentials (ошибка записи файла)."
+
+
+def delete_account_credentials(account_id: str) -> Tuple[bool, str]:
+    """
+    Удаляет credentials для аккаунта из локального хранилища.
+    """
+    aid = normalize_account_id(account_id)
+    if not aid:
+        return False, "Некорректный account_id."
+    try:
+        store_path = str(AVITO_CREDENTIALS_STORE_PATH or "").strip() or os.path.join(DATA_DIR, "avito_credentials.json")
+        data = _safe_load_json(store_path, {})
+        if not isinstance(data, dict):
+            return False, "Хранилище credentials повреждено."
+        if aid not in data:
+            return False, "Для аккаунта credentials не заданы."
+        data.pop(aid, None)
+        _safe_save_json(store_path, data)
+        return True, "Credentials удалены."
+    except Exception as e:
+        logger.exception("Failed to delete avito credentials for account_id=%s: %s", aid, e)
+        return False, "Не удалось удалить credentials (ошибка записи файла)."
 
 
 def delete_account(account_id: str) -> Tuple[bool, str]:

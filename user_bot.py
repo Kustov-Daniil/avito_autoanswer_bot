@@ -62,6 +62,7 @@ from utils.avito_accounts import (
     delete_account as delete_avito_account,
     set_mode as set_avito_account_mode,
     set_account_credentials as set_avito_account_credentials,
+    delete_account_credentials as delete_avito_account_credentials,
 )
 from avito_api import get_subscriptions
 
@@ -256,7 +257,6 @@ async def _knowledge_cards_from_text_via_llm(raw_text: str) -> List[Dict[str, An
 
 # Инициализация
 user_router = Router()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # ----------------------------
@@ -333,13 +333,15 @@ def _account_status_text(acc: Dict[str, Any]) -> str:
     paused = bool(acc.get("paused", False))
     mode = (acc.get("mode") or BOT_MODE_FULL).strip()
     partial = int(acc.get("partial_percentage", 50) or 50)
-    has_creds = bool((acc.get("client_id") or "").strip() and (acc.get("client_secret") or "").strip())
+    from config import has_avito_credentials
+
+    has_creds = has_avito_credentials(aid)
     paused_txt = "⏸ ПАУЗА" if paused else "▶️ АКТИВЕН"
     title = f"{aid}" + (f" — {name}" if name else "")
     return (
         f"🧾 <b>Avito аккаунт</b>\n"
         f"• <b>{title}</b>\n"
-        f"• Креды: <b>{'✅ настроены' if has_creds else '❌ нет client_id/secret'}</b>\n"
+        f"• Credentials: <b>{'✅ настроены' if has_creds else '❌ не настроены (.env)'}</b>\n"
         f"• Статус: <b>{paused_txt}</b>\n"
         f"• Режим: <b>{_acc_mode_label(mode, partial)}</b>"
     )
@@ -360,13 +362,20 @@ async def _safe_edit_text(message: Message, text: str, *, reply_markup: Optional
 
 def _unique_avito_app_creds() -> List[Dict[str, str]]:
     """
-    Возвращает список уникальных наборов (client_id, client_secret) из avito_accounts.json.
+    Возвращает список уникальных наборов (client_id, client_secret) из источников credentials
+    (локальный store / .env).
+
+    Нужно для subscribe/unsubscribe webhook для всех аккаунтов (multi-account).
     """
+    from config import get_avito_credentials
+
     seen = set()
     out: List[Dict[str, str]] = []
     for a in list_accounts():
-        cid = str(a.get("client_id") or "").strip()
-        csec = str(a.get("client_secret") or "").strip()
+        aid = str(a.get("account_id") or "").strip()
+        cid, csec = get_avito_credentials(aid)
+        cid = str(cid or "").strip()
+        csec = str(csec or "").strip()
         if not cid or not csec:
             continue
         key = (cid, csec)
@@ -390,16 +399,31 @@ def _get_account_creds(account_id: str) -> tuple[Optional[str], Optional[str], O
     """
     Возвращает (client_id, client_secret, error_msg).
     """
-    acc = get_avito_account(account_id) or {}
-    cid = str(acc.get("client_id") or "").strip()
-    csec = str(acc.get("client_secret") or "").strip()
+    from config import get_avito_credentials
+
+    cid, csec = get_avito_credentials(account_id)
     if not cid or not csec:
-        return None, None, "❌ Для аккаунта не заполнены client_id/client_secret (зайдите в /accounts → Добавить заново или пришлите креды)."
+        return (
+            None,
+            None,
+            "❌ Для аккаунта не заданы credentials.\n\n"
+            "Задайте в `.env`:\n"
+            f"- `AVITO_ACCOUNTS_CREDENTIALS_JSON` (рекомендуется, per-account)\n"
+            "или\n"
+            "- `AVITO_CLIENT_ID` / `AVITO_CLIENT_SECRET` (глобально)\n\n"
+            "После этого перезапустите сервис.",
+        )
     return cid, csec, None
 
-# Инициализация OpenAI клиента
-http_client = httpx.AsyncClient()
-client = AsyncOpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+# Инициализация OpenAI клиента (опционально)
+http_client = None
+client = None
+if OPENAI_API_KEY:
+    try:
+        http_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+    except Exception as e:
+        logger.warning("Не удалось инициализировать OpenAI client: %s", e)
 
 # Инициализация директории данных
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -435,6 +459,8 @@ class AdminStates(StatesGroup):
     waiting_for_avito_account_add_client_secret = State()
     waiting_for_avito_account_add_name = State()
     waiting_for_avito_account_partial_percentage = State()
+    waiting_for_avito_account_set_client_id = State()
+    waiting_for_avito_account_set_client_secret = State()
 
 
 def _check_admin(user_id: int) -> bool:
@@ -717,73 +743,126 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 
 # ----------------------------
+# /help — краткая справка
+# ----------------------------
+@user_router.message(F.text.regexp(r"^/help\b"))
+async def cmd_help(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    is_admin = _check_admin(message.from_user.id)
+    lines = [
+        "ℹ️ <b>Помощь</b>",
+        "",
+        "Я отвечаю на сообщения через LLM, используя:",
+        "- system prompt",
+        "- static/dynamic context",
+        "- историю диалога",
+        "- knowledge cards",
+        "",
+        "Команды:",
+        "- /reset — сбросить контекст (историю) для этого чата",
+    ]
+    if is_admin:
+        lines += [
+            "- /botstatus — управление ботом (on/off, режим, модель)",
+            "- /accounts — Avito аккаунты (multi-account)",
+            "- /knowledge или /kb — база знаний (knowledge cards)",
+            "- /staticcontext, /dynamiccontext, /systemprompt — управление контекстом",
+            "- /subscribe, /unsubscribe — управление webhook",
+            "- /stats — статистика",
+        ]
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ----------------------------
+# /reset — сброс контекста (истории) для текущего Telegram-диалога
+# ----------------------------
+@user_router.message(F.text.regexp(r"^/reset\b|^/reset_context\b"))
+async def cmd_reset_context(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    from utils.chat_history import delete_dialog
+
+    dialog_id = f"tg_{message.from_user.id}"
+    existed = delete_dialog(dialog_id)
+    await message.answer(
+        "✅ Контекст сброшен (история очищена)." if existed else "✅ Контекст уже был пуст.",
+        parse_mode="HTML",
+    )
+
+
+# ----------------------------
+# /status — alias для /botstatus
+# ----------------------------
+@user_router.message(F.text.regexp(r"^/status\b"))
+async def cmd_status_alias(message: Message, state: FSMContext) -> None:
+    await cmd_bot_status_menu(message, state)
+
+
+def _build_admin_panel_ui() -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Единая админ-панель: объединяет /status, /botstatus и /accounts.
+    """
+    current_status = is_bot_enabled()
+    status_text = "🟢 ВКЛЮЧЕН" if current_status else "🔴 ВЫКЛЮЧЕН"
+    current_mode = get_bot_mode()
+    partial_percent = get_partial_percentage()
+    current_mode_name = _mode_label(current_mode, partial_percent)
+    current_model = get_llm_model("gpt-4o")
+    model_display_names = {
+        "gpt-5": "Chat GPT 5",
+        "gpt-5-mini": "Chat GPT 5 mini",
+        "gpt-4o": "Chat GPT 4o",
+    }
+    current_model_name = model_display_names.get(current_model, current_model)
+    bot_version = get_bot_version()
+
+    buttons: List[List[InlineKeyboardButton]] = []
+    if current_status:
+        buttons.append([InlineKeyboardButton(text="🔴 Выключить бота", callback_data="bot_off")])
+    else:
+        buttons.append([InlineKeyboardButton(text="🟢 Включить бота", callback_data="bot_on")])
+
+    buttons.append([InlineKeyboardButton(text="⚙️ Режим работы бота", callback_data="bot_mode_menu")])
+    buttons.append([InlineKeyboardButton(text="🤖 Выбрать модель LLM", callback_data="llm_model_menu")])
+    buttons.append([InlineKeyboardButton(text="👥 Avito аккаунты", callback_data="admin_open_accounts")])
+    buttons.append(
+        [
+            InlineKeyboardButton(text="🔗 Подключить webhook", callback_data="webhook_subscribe"),
+            InlineKeyboardButton(text="🔌 Отключить webhook", callback_data="webhook_unsubscribe"),
+        ]
+    )
+
+    text = (
+        "🧭 <b>Панель управления</b>\n\n"
+        f"📊 Статус бота: <b>{status_text}</b>\n"
+        f"⚙️ Режим: <b>{current_mode_name}</b>\n"
+        f"🤖 Модель LLM: <b>{current_model_name}</b>\n"
+        f"📦 Версия: <b>{bot_version}</b>\n\n"
+        "Выберите действие:"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ----------------------------
 # /botstatus — управление ботом
 # ----------------------------
 @user_router.message(F.text.regexp(r"^/botstatus\b"))
 async def cmd_bot_status_menu(message: Message, state: FSMContext) -> None:
-    """Показывает меню управления ботом (ON/OFF и выбор модели LLM)."""
+    """Единая админ-панель (alias для /status и /accounts)."""
     if not _check_admin(message.from_user.id):
         await message.answer("⛔️ Недостаточно прав.")
         return
     
     await state.clear()
-    
-    # Определяем текущий статус
-    current_status = is_bot_enabled()
-    status_text = "🟢 ВКЛЮЧЕН" if current_status else "🔴 ВЫКЛЮЧЕН"
-    
-    # Получаем текущий режим работы
-    current_mode = get_bot_mode()
-    partial_percent = get_partial_percentage()
-    current_mode_name = _mode_label(current_mode, partial_percent)
-    
-    # Получаем текущую модель LLM
-    current_model = get_llm_model("gpt-4o")
-    model_display_names = {
-        "gpt-5": "Chat GPT 5",
-        "gpt-5-mini": "Chat GPT 5 mini",
-        "gpt-4o": "Chat GPT 4o"
-    }
-    current_model_name = model_display_names.get(current_model, current_model)
-    
-    # Получаем версию бота
-    bot_version = get_bot_version()
-    
-    # Создаем inline кнопки в зависимости от текущего статуса
-    buttons = []
-    
-    # Кнопка включения/выключения бота
-    if current_status:
-        buttons.append([InlineKeyboardButton(text="🔴 Выключить бота", callback_data="bot_off")])
-    else:
-        buttons.append([InlineKeyboardButton(text="🟢 Включить бота", callback_data="bot_on")])
-    
-    # Кнопки для выбора режима работы
-    buttons.append([InlineKeyboardButton(text="⚙️ Режим работы бота", callback_data="bot_mode_menu")])
-    
-    # Кнопки для выбора модели LLM
-    buttons.append([InlineKeyboardButton(text="🤖 Выбрать модель LLM", callback_data="llm_model_menu")])
-    
-    # Кнопки для webhook
-    buttons.append([
-        InlineKeyboardButton(text="🔗 Подключить webhook", callback_data="webhook_subscribe"),
-        InlineKeyboardButton(text="🔌 Отключить webhook", callback_data="webhook_unsubscribe"),
-    ])
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
-    mode_info = f"📊 Режим: {current_mode_name}"
-    
-    await message.answer(
-        f"🤖 Управление ботом\n\n"
-        f"📊 Текущий статус бота: {status_text}\n"
-        f"⚙️ Режим работы: <b>{current_mode_name}</b>\n"
-        f"🤖 Текущая модель LLM: {current_model_name}\n"
-        f"📦 Версия бота: <b>{bot_version}</b>\n\n"
-        "Выберите действие:",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+    text, kb = _build_admin_panel_ui()
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@user_router.callback_query(F.data == "admin_panel")
+async def callback_admin_panel(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    text, kb = _build_admin_panel_ui()
+    await _safe_edit_text(callback.message, text, reply_markup=kb, parse_mode="HTML")
 
 
 # ----------------------------
@@ -810,7 +889,9 @@ def _build_accounts_menu_ui() -> tuple[str, InlineKeyboardMarkup]:
         paused = bool(a.get("paused", False))
         mode = (a.get("mode") or BOT_MODE_FULL).strip()
         partial = int(a.get("partial_percentage", 50) or 50)
-        has_creds = bool((a.get("client_id") or "").strip() and (a.get("client_secret") or "").strip())
+        from config import has_avito_credentials
+
+        has_creds = has_avito_credentials(aid)
         status_icon = "⏸" if paused else "▶️"
         mode_icon = {"listening": "🧠", "partial": "🧪", "full": "🚀"}.get(mode, "⚙️")
         creds_icon = "🔑" if has_creds else "⚠️"
@@ -821,18 +902,23 @@ def _build_accounts_menu_ui() -> tuple[str, InlineKeyboardMarkup]:
         InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="acc_add"),
         InlineKeyboardButton(text="🔄 Обновить", callback_data="accounts_refresh"),
     ])
+    buttons.append([InlineKeyboardButton(text="🔙 Панель", callback_data="admin_panel")])
 
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 @user_router.message(F.text.regexp(r"^/accounts\b"))
 async def cmd_accounts(message: Message, state: FSMContext) -> None:
-    if not _check_admin(message.from_user.id):
-        await message.answer("⛔️ Недостаточно прав.")
-        return
+    # /accounts теперь ведёт в единую панель (там есть кнопка "Avito аккаунты")
+    await cmd_bot_status_menu(message, state)
+
+
+@user_router.callback_query(F.data == "admin_open_accounts")
+async def callback_admin_open_accounts(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
     await state.clear()
     text, kb = _build_accounts_menu_ui()
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await _safe_edit_text(callback.message, text, reply_markup=kb, parse_mode="HTML")
 
 
 @user_router.callback_query(F.data == "accounts_refresh")
@@ -855,6 +941,10 @@ def _build_account_details_ui(account_id: str) -> tuple[str, InlineKeyboardMarku
 
     buttons = [
         [InlineKeyboardButton(text=pause_btn, callback_data=f"acc_toggle_pause:{aid}")],
+        [
+            InlineKeyboardButton(text="🔑 Установить creds", callback_data=f"acc_set_creds:{aid}"),
+            InlineKeyboardButton(text="🗑️ Удалить creds", callback_data=f"acc_del_creds:{aid}"),
+        ],
         [InlineKeyboardButton(text="📊 Статистика аккаунта", callback_data=f"acc_stats:{aid}")],
         [
             InlineKeyboardButton(text="🔗 Webhook (этот аккаунт)", callback_data=f"acc_hook_sub:{aid}"),
@@ -925,6 +1015,72 @@ async def callback_account_toggle_pause(callback: CallbackQuery) -> None:
     acc = get_avito_account(aid) or {}
     new_paused = not bool(acc.get("paused", False))
     set_avito_account_paused(aid, new_paused)
+    text, kb = _build_account_details_ui(aid)
+    await _safe_edit_text(callback.message, text, reply_markup=kb, parse_mode="HTML")
+
+
+@user_router.callback_query(F.data.startswith("acc_set_creds:"))
+async def callback_account_set_creds(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    aid = (callback.data or "").split(":", 1)[1].strip()
+    await state.clear()
+    await state.set_state(AdminStates.waiting_for_avito_account_set_client_id)
+    await state.update_data(avito_creds_account_id=aid)
+    await callback.message.answer(
+        f"Введите <b>Client ID</b> для Avito аккаунта <b>{aid}</b>.\n"
+        "Отмена: /cancel",
+        parse_mode="HTML",
+    )
+
+
+@user_router.message(AdminStates.waiting_for_avito_account_set_client_id)
+async def handle_account_set_client_id(message: Message, state: FSMContext) -> None:
+    if not _check_admin(message.from_user.id):
+        await state.clear()
+        return
+    txt = (message.text or "").strip()
+    if not txt:
+        await message.answer("❌ Client ID не должен быть пустым.")
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await state.update_data(avito_creds_client_id=txt)
+    await state.set_state(AdminStates.waiting_for_avito_account_set_client_secret)
+    await message.answer("Введите <b>Client Secret</b>.\nОтмена: /cancel", parse_mode="HTML")
+
+
+@user_router.message(AdminStates.waiting_for_avito_account_set_client_secret)
+async def handle_account_set_client_secret(message: Message, state: FSMContext) -> None:
+    if not _check_admin(message.from_user.id):
+        await state.clear()
+        return
+    txt = (message.text or "").strip()
+    if not txt:
+        await message.answer("❌ Client Secret не должен быть пустым.")
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    data = await state.get_data()
+    aid = str(data.get("avito_creds_account_id") or "").strip()
+    cid = str(data.get("avito_creds_client_id") or "").strip()
+    csec = txt
+    ok, msg = set_avito_account_credentials(aid, cid, csec)
+    await state.clear()
+    await message.answer(("✅ " if ok else "❌ ") + msg)
+    text, kb = _build_account_details_ui(aid)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@user_router.callback_query(F.data.startswith("acc_del_creds:"))
+async def callback_account_delete_creds(callback: CallbackQuery) -> None:
+    await callback.answer()
+    aid = (callback.data or "").split(":", 1)[1].strip()
+    ok, msg = delete_avito_account_credentials(aid)
+    await callback.message.answer(("✅ " if ok else "❌ ") + msg)
     text, kb = _build_account_details_ui(aid)
     await _safe_edit_text(callback.message, text, reply_markup=kb, parse_mode="HTML")
 
@@ -1052,7 +1208,6 @@ async def handle_account_add_client_id(message: Message, state: FSMContext) -> N
     if not txt:
         await message.answer("❌ Client ID не должен быть пустым.")
         return
-    # Пробуем скрыть сообщение с кредами (если есть права)
     try:
         await message.delete()
     except Exception:
@@ -1111,7 +1266,8 @@ async def handle_account_add_name(message: Message, state: FSMContext) -> None:
     if ok:
         ok2, msg2 = set_avito_account_credentials(aid, cid, csec)
         ok = ok and ok2
-        msg = msg + (" " + msg2 if msg2 else "")
+        if msg2:
+            msg = msg + " " + msg2
     await state.clear()
     await message.answer(("✅ " if ok else "❌ ") + msg)
     text, kb = _build_account_details_ui(aid)
@@ -3158,12 +3314,15 @@ async def setup_bot_menu() -> None:
         # Определяем команды для меню
         commands = [
             BotCommand(command="start", description="Приветствие и описание возможностей"),
+            BotCommand(command="help", description="Краткая справка"),
+            BotCommand(command="reset", description="Сбросить контекст (историю) для этого чата"),
         ]
         
         # Команды для администраторов
         admin_commands = [
+            BotCommand(command="status", description="Статус (alias для /botstatus)"),
             BotCommand(command="botstatus", description="Управление ботом (ON/OFF и webhook)"),
-            BotCommand(command="accounts", description="Avito аккаунты (режимы/пауза)"),
+            BotCommand(command="accounts", description="Avito аккаунты (внутри панели)"),
             BotCommand(command="stats", description="Статистика работы бота"),
             BotCommand(command="agnt_week_overall", description="Анализ истории чатов за неделю"),
             BotCommand(command="faq", description="Управление FAQ"),

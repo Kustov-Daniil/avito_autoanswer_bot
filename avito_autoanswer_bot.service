@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/home/avito_autoanswer_bot
+EnvironmentFile=-/home/avito_autoanswer_bot/.env
 Environment="PATH=/home/avito_autoanswer_bot/venv/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=/home/avito_autoanswer_bot/venv/bin/python3 main.py
 Restart=on-failure

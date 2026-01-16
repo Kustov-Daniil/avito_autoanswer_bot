@@ -24,7 +24,9 @@ from aiogram.client.default import DefaultBotProperties
 from config import (
     TELEGRAM_MANAGER_ID, TELEGRAM_MANAGERS, TELEGRAM_BOT_TOKEN,
     AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_ACCOUNT_ID,
-    SIGNAL_PHRASES, DATA_DIR, COOLDOWN_MINUTES_AFTER_MANAGER, ADMINS
+    SIGNAL_PHRASES, DATA_DIR, COOLDOWN_MINUTES_AFTER_MANAGER, ADMINS,
+    LOG_LEVEL, LOG_WEBHOOK_PAYLOAD, LOG_PII,
+    AVITO_WEBHOOK_ENDPOINT, HEALTH_ENDPOINT, FLASK_HOST, FLASK_PORT,
 )
 from avito_api import send_message, list_messages_v3
 from avito_sessions import (
@@ -60,7 +62,7 @@ log_format = logging.Formatter(
 
 # Настройка root logger
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
+root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 # Очистка существующих обработчиков
 root_logger.handlers.clear()
@@ -80,11 +82,8 @@ root_logger.addHandler(console_handler)
 logger = logging.getLogger(__name__)
 logger.info("Logging initialized. Log file: %s", LOG_FILE)
 
-# Константы для webhook обработки
-WEBHOOK_ENDPOINT: str = "/avito/webhook"
-HEALTH_ENDPOINT: str = "/health"
-FLASK_HOST: str = "0.0.0.0"
-FLASK_PORT: int = 8080
+# Константы для webhook обработки берём из config.py
+WEBHOOK_ENDPOINT: str = AVITO_WEBHOOK_ENDPOINT
 
 # Регулярные выражения для извлечения данных
 # Паттерны для извлечения chat_id (должны включать тильду ~)
@@ -106,7 +105,8 @@ def check_config() -> bool:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not TELEGRAM_MANAGERS:
         missing.append("MANAGERS или TELEGRAM_MANAGER_ID")
-    # AVITO_CLIENT_ID/SECRET могут быть не заданы, если они хранятся per-account в data/avito_accounts.json
+    # AVITO_CLIENT_ID/SECRET могут быть не заданы, если используются per-account credentials из .env
+    # (см. AVITO_ACCOUNTS_CREDENTIALS_JSON).
     # AVITO_ACCOUNT_ID теперь опционален: при multi-account account_id может приходить в webhook payload.
     # Если он не задан — используем account_id из webhook (если Avito его присылает).
     
@@ -128,7 +128,7 @@ def check_config() -> bool:
 
 # Проверяем конфигурацию при импорте
 if not check_config():
-    logger.warning("Some configuration variables are missing. The bot may not work correctly.")
+    raise SystemExit(2)
 
 app = Flask(__name__)
 
@@ -235,7 +235,14 @@ async def _notify_manager_for_chat(
         cid, csec = resolve_credentials_for_account(account_id)
         chat_info = get_chat(chat_id, account_id=account_id, client_id=cid, client_secret=csec)
         if chat_info:
-            logger.info("Retrieved chat info for chat %s: %s", chat_id, json.dumps(chat_info, indent=2, ensure_ascii=False)[:500])
+            if LOG_PII:
+                logger.info(
+                    "Retrieved chat info for chat %s: %s",
+                    chat_id,
+                    json.dumps(chat_info, indent=2, ensure_ascii=False)[:500],
+                )
+            else:
+                logger.info("Retrieved chat info for chat %s (details hidden, LOG_PII=0)", chat_id)
             # Извлекаем имя пользователя из chat_info
             user_data = chat_info.get("user") or chat_info.get("interlocutor") or chat_info.get("interlocutor_info") or {}
             if isinstance(user_data, dict):
@@ -257,8 +264,11 @@ async def _notify_manager_for_chat(
         cid, csec = resolve_credentials_for_account(account_id)
         history = list_messages_v3(chat_id, limit=50, offset=0, account_id=account_id, client_id=cid, client_secret=csec)
         logger.info("Retrieved %d messages from history for chat %s", len(history), chat_id)
-        if history:
-            logger.debug("First message sample: %s", json.dumps(history[0] if history else {}, indent=2, ensure_ascii=False)[:300])
+        if history and LOG_PII:
+            logger.debug(
+                "First message sample: %s",
+                json.dumps(history[0], indent=2, ensure_ascii=False)[:300],
+            )
     except Exception as e:
         logger.warning("Failed to fetch message history for chat %s: %s", chat_id, e)
         logger.exception("Full exception details:")
@@ -799,18 +809,11 @@ def resolve_account_id_for_chat(chat_id: str) -> Optional[str]:
 def resolve_credentials_for_account(account_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """
     Возвращает (client_id, client_secret) для account_id.
-    Сначала пытаемся взять из data/avito_accounts.json; если нет — fallback на .env.
+    Credentials берём только из .env (секреты в JSON запрещены).
     """
     cid, csec = get_account_credentials(account_id)
     if cid and csec:
         return cid, csec
-    # fallback на .env
-    try:
-        from config import AVITO_CLIENT_ID as _CID, AVITO_CLIENT_SECRET as _CSEC
-        if _CID and _CSEC:
-            return str(_CID).strip(), str(_CSEC).strip()
-    except Exception:
-        pass
     return None, None
 
 
@@ -842,7 +845,17 @@ def avito_webhook() -> Response:
     logger.info("=" * 80)
     logger.info("📥 INCOMING WEBHOOK")
     logger.info("=" * 80)
-    logger.info("Webhook payload structure (first 2000 chars):\n%s", json.dumps(data, indent=2, ensure_ascii=False)[:2000])
+    if LOG_WEBHOOK_PAYLOAD and LOG_PII:
+        logger.info(
+            "Webhook payload structure (first 2000 chars):\n%s",
+            json.dumps(data, indent=2, ensure_ascii=False)[:2000],
+        )
+    else:
+        # По умолчанию не логируем payload целиком (privacy). Достаточно ключей/метаданных.
+        try:
+            logger.info("Webhook payload keys: %s", sorted(list(data.keys()))[:50])
+        except Exception:
+            logger.info("Webhook received (payload keys unavailable)")
     
     # Извлекаем account_id ДО обработки, чтобы видеть его в логах
     extracted_account_id = extract_account_id_from_webhook(data)
@@ -935,7 +948,11 @@ def avito_webhook() -> Response:
             # Лог для диагностики: если account_id не нашли
             if not current_account_id:
                 logger.warning("⚠️ account_id not found in webhook for chat_id=%s (multi-account may not work)", chat_id)
-                logger.warning("   Webhook payload structure: %s", json.dumps(data, indent=2, ensure_ascii=False)[:1000])
+                if LOG_WEBHOOK_PAYLOAD and LOG_PII:
+                    logger.warning(
+                        "   Webhook payload structure: %s",
+                        json.dumps(data, indent=2, ensure_ascii=False)[:1000],
+                    )
             
             # Проверяем, может ли токен получить доступ к этому чату
             if current_account_id:
@@ -948,7 +965,7 @@ def avito_webhook() -> Response:
                                "***" if csec else None)
                     if not cid or not csec:
                         logger.warning("❌ No client_id/client_secret for account_id=%s yet; cannot call get_chat", current_account_id)
-                        logger.warning("   Проверьте, что credentials установлены для этого аккаунта через команду /set_account_credentials")
+                        logger.warning("   Проверьте, что credentials заданы в .env (AVITO_ACCOUNTS_CREDENTIALS_JSON или AVITO_CLIENT_ID/SECRET) и сервис перезапущен")
                         chat_info = None
                     else:
                         logger.info("🔍 Attempting to get chat info: chat_id=%s, account_id=%s", chat_id, current_account_id)
@@ -977,7 +994,7 @@ def avito_webhook() -> Response:
                         logger.error("   1. Убедитесь, что account_id = ID основного аккаунта компании (не сотрудника)")
                         logger.error("   2. Убедитесь, что client_id и client_secret принадлежат этому аккаунту")
                         logger.error("   3. Проверьте права приложения в личном кабинете Avito")
-                        logger.error("   4. Проверьте, что credentials установлены правильно через /set_account_credentials")
+                        logger.error("   4. Проверьте, что credentials заданы в .env и сервис перезапущен")
                     else:
                         logger.warning("Предупреждение при проверке чата: %s", e)
                         logger.exception("Полная информация об ошибке:")
@@ -1133,8 +1150,15 @@ def avito_webhook() -> Response:
                            chat_id, current_account_id)
                 return
             
-            logger.info("✅ Message passed all filters: chat_id=%s, account_id=%s, text='%s'", 
-                       chat_id, current_account_id, text[:100])
+            if LOG_PII:
+                logger.info(
+                    "✅ Message passed all filters: chat_id=%s, account_id=%s, text='%s'",
+                    chat_id,
+                    current_account_id,
+                    text[:100],
+                )
+            else:
+                logger.info("✅ Message passed all filters: chat_id=%s, account_id=%s", chat_id, current_account_id)
 
             # Сохраняем входящее сообщение пользователя в историю (до любых early-return)
             dialog_id = f"avito_{chat_id}"
@@ -1166,7 +1190,7 @@ def avito_webhook() -> Response:
                        current_account_id, bool(cid), bool(csec))
             if not cid or not csec:
                 logger.error("❌ No client_id/client_secret for account_id=%s - cannot send message", current_account_id)
-                logger.error("   Установите credentials через команду /set_account_credentials %s <client_id> <client_secret>", current_account_id)
+                logger.error("   Установите credentials в .env (AVITO_ACCOUNTS_CREDENTIALS_JSON или AVITO_CLIENT_ID/SECRET) и перезапустите сервис")
                 await _notify_manager_for_chat(chat_id, text, data, thread_bot, account_id=current_account_id)
                 return
 
@@ -1466,7 +1490,7 @@ async def _poll_unread_chats_loop(*, interval_seconds: int = 15, webhook_grace_s
 
 
 # Менеджер отвечает в ТГ REPLY на уведомление (содержит Avito Chat ID)
-@dp.message(F.reply_to_message & F.reply_to_message.from_user.id == bot.id)
+@dp.message(F.reply_to_message & F.reply_to_message.from_user.is_bot)
 async def manager_reply_handler(message: Message) -> None:
     """
     Обрабатывает reply менеджера на уведомление от бота.
@@ -1549,7 +1573,8 @@ async def manager_reply_handler(message: Message) -> None:
             logger.warning("Chat ID seems incomplete: %s (expected format: u2i-...~... or u2u-...~...)", chat_id)
     else:
         logger.warning("Could not extract chat_id from notification. Text preview: %s", base_text[:500])
-        logger.warning("Full notification text: %s", base_text)
+        if LOG_PII:
+            logger.warning("Full notification text: %s", base_text)
 
     if not chat_id:
         await safe_send_message(
@@ -1684,6 +1709,8 @@ def run_flask() -> None:
 
 async def run_bot() -> None:
     """Запускает Telegram бота через polling."""
+    if bot is None:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set; cannot start Telegram polling")
     # Устанавливаем меню бота при запуске
     try:
         from user_bot import setup_bot_menu

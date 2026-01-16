@@ -7,11 +7,25 @@
 
 import os
 import logging
-from typing import Optional, List
+import json
+from typing import Optional, List, Tuple, Dict, Any
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
+
+def _parse_bool(value: Optional[str], *, default: bool = False) -> bool:
+    """
+    Парсит булево значение из env.
+
+    True считаем для: 1/true/yes/y/on (в любом регистре).
+    """
+    if value is None:
+        return default
+    v = str(value).strip().lower()
+    if not v:
+        return default
+    return v in {"1", "true", "yes", "y", "on"}
 
 
 def _parse_admins(admins_str: Optional[str]) -> List[int]:
@@ -105,6 +119,115 @@ AVITO_CLIENT_ID: Optional[str] = os.getenv("AVITO_CLIENT_ID")
 AVITO_CLIENT_SECRET: Optional[str] = os.getenv("AVITO_CLIENT_SECRET")
 AVITO_ACCOUNT_ID: Optional[str] = os.getenv("AVITO_ACCOUNT_ID")  # user_id компании (основной аккаунт)
 
+# Локальное хранилище credentials, которое может обновляться ботом из Telegram.
+# ВАЖНО: этот файл должен быть в .gitignore (секреты не должны попадать в git).
+AVITO_CREDENTIALS_STORE_PATH: str = os.getenv(
+    "AVITO_CREDENTIALS_STORE_PATH",
+    os.path.join("data", "avito_credentials.json"),
+).strip()
+
+# Multi-account credentials (безопасно): secrets храним только в .env, не в JSON-файлах.
+#
+# Вариант 1 (рекомендуется): JSON в env переменной (удобно для нескольких аккаунтов):
+#   AVITO_ACCOUNTS_CREDENTIALS_JSON='{"417713955": {"client_id": "...", "client_secret": "..."}}'
+#
+# Вариант 2 (fallback): глобальные AVITO_CLIENT_ID/AVITO_CLIENT_SECRET (одни на все аккаунты).
+AVITO_ACCOUNTS_CREDENTIALS_JSON: str = os.getenv("AVITO_ACCOUNTS_CREDENTIALS_JSON", "").strip()
+
+
+def _parse_avito_accounts_credentials(raw: str) -> Dict[str, Dict[str, str]]:
+    """
+    Парсит карту credentials из env.
+
+    Ожидаемый формат:
+      {"<account_id>": {"client_id": "...", "client_secret": "..."}, ...}
+    """
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        logging.warning("AVITO_ACCOUNTS_CREDENTIALS_JSON is not valid JSON - ignoring")
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    for k, v in obj.items():
+        aid = str(k).strip()
+        if not aid or not aid.isdigit() or not isinstance(v, dict):
+            continue
+        cid = str(v.get("client_id") or "").strip()
+        csec = str(v.get("client_secret") or "").strip()
+        if cid and csec:
+            out[aid] = {"client_id": cid, "client_secret": csec}
+    return out
+
+
+_AVITO_ACCOUNTS_CREDS: Dict[str, Dict[str, str]] = _parse_avito_accounts_credentials(AVITO_ACCOUNTS_CREDENTIALS_JSON)
+
+
+def _load_avito_credentials_store(path: str) -> Dict[str, Dict[str, str]]:
+    """
+    Загружает локальное хранилище credentials (обновляемое через Telegram, без рестарта).
+
+    Формат файла:
+      {
+        "<account_id>": {"client_id": "...", "client_secret": "...", "updated_at": "..."},
+        ...
+      }
+    """
+    if not path:
+        return {}
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    for k, v in obj.items():
+        aid = str(k).strip()
+        if not aid or not aid.isdigit() or not isinstance(v, dict):
+            continue
+        cid = str(v.get("client_id") or "").strip()
+        csec = str(v.get("client_secret") or "").strip()
+        if cid and csec:
+            out[aid] = {"client_id": cid, "client_secret": csec}
+    return out
+
+
+def get_avito_credentials(account_id: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Возвращает (client_id, client_secret) для account_id.
+
+    Приоритет:
+    0) AVITO_CREDENTIALS_STORE_PATH (локальный файл, обновляемый через Telegram)
+    1) AVITO_ACCOUNTS_CREDENTIALS_JSON (per-account)
+    2) AVITO_CLIENT_ID / AVITO_CLIENT_SECRET (глобальные)
+    """
+    aid = str(account_id or "").strip()
+    if aid and aid.isdigit():
+        store = _load_avito_credentials_store(AVITO_CREDENTIALS_STORE_PATH)
+        item0 = store.get(aid)
+        if item0:
+            return item0.get("client_id"), item0.get("client_secret")
+    if aid and aid.isdigit():
+        item = _AVITO_ACCOUNTS_CREDS.get(aid)
+        if item:
+            return item.get("client_id"), item.get("client_secret")
+    # fallback на глобальные
+    cid = str(AVITO_CLIENT_ID).strip() if AVITO_CLIENT_ID else None
+    csec = str(AVITO_CLIENT_SECRET).strip() if AVITO_CLIENT_SECRET else None
+    return cid, csec
+
+
+def has_avito_credentials(account_id: Optional[str]) -> bool:
+    cid, csec = get_avito_credentials(account_id)
+    return bool(cid and csec)
+
 # OpenAI / LLM
 OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
 _default_llm_model: str = os.getenv("LLM_MODEL", "gpt-4o")
@@ -155,6 +278,35 @@ VERSION_PATH: str = "version.txt"  # Файл версии (не в data/, чт�
 # Публичная база (для вебхука)
 PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 WEBHOOK_URL: str = f"{PUBLIC_BASE_URL}/avito/webhook" if PUBLIC_BASE_URL else ""
+
+# -----------------------------
+# Webhook / Server (Flask)
+# -----------------------------
+# Где слушает Flask внутри сервера (обычно 0.0.0.0)
+FLASK_HOST: str = os.getenv("FLASK_HOST", "0.0.0.0").strip() or "0.0.0.0"
+
+# Порт Flask (по умолчанию 8080)
+FLASK_PORT: int = int(os.getenv("FLASK_PORT", "8080"))
+
+# URL-пути эндпоинтов
+AVITO_WEBHOOK_ENDPOINT: str = os.getenv("AVITO_WEBHOOK_ENDPOINT", "/avito/webhook").strip() or "/avito/webhook"
+HEALTH_ENDPOINT: str = os.getenv("HEALTH_ENDPOINT", "/health").strip() or "/health"
+
+# -----------------------------
+# Limits
+# -----------------------------
+# Ограничение Avito на длину сообщения (лучше держать небольшой запас)
+MAX_AVITO_MESSAGE_LENGTH: int = int(os.getenv("MAX_AVITO_MESSAGE_LENGTH", "950"))
+
+# Logging
+# LOG_LEVEL: DEBUG/INFO/WARNING/ERROR (по умолчанию INFO)
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+
+# Логировать ли входящие webhook payload целиком (может содержать PII) — по умолчанию НЕТ
+LOG_WEBHOOK_PAYLOAD: bool = _parse_bool(os.getenv("LOG_WEBHOOK_PAYLOAD"), default=False)
+
+# Разрешить ли логирование “пользовательского контента” (PII/история/тексты) — по умолчанию НЕТ
+LOG_PII: bool = _parse_bool(os.getenv("LOG_PII"), default=False)
 
 
 def get_bot_version() -> str:

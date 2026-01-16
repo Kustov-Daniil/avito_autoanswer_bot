@@ -412,3 +412,34 @@ def clear_dialog_processed_flag(dialog_id: str, chat_history: Optional[Dict[str,
     except Exception as e:
         logger.warning("Failed to clear processed flag for dialog_id=%s: %s", dialog_id, e)
 
+
+def delete_dialog(dialog_id: str) -> bool:
+    """
+    Полностью удаляет диалог из chat_history.json (и его метаданные).
+
+    Используется для UX команд типа “сбросить контекст”.
+    """
+    if not dialog_id or not str(dialog_id).strip():
+        return False
+    did = str(dialog_id).strip()
+    try:
+        chat_history = _load_json(CHAT_HISTORY_PATH, {})
+        if not isinstance(chat_history, dict):
+            return False
+
+        existed = False
+        if did in chat_history:
+            chat_history.pop(did, None)
+            existed = True
+
+        meta = chat_history.get("_meta")
+        if isinstance(meta, dict) and did in meta:
+            meta.pop(did, None)
+            existed = True
+
+        _save_json(CHAT_HISTORY_PATH, chat_history)
+        return existed
+    except Exception as e:
+        logger.warning("Failed to delete dialog dialog_id=%s: %s", did, e)
+        return False
+

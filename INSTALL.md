@@ -90,9 +90,9 @@ scp .env root@your-server-ip:/home/avito_autoanswer_bot/.env
 - `TELEGRAM_BOT_TOKEN` - токен Telegram бота
 - `ADMINS` - ID администраторов (через запятую)
 - `MANAGERS` - ID менеджеров (через запятую)
-- `AVITO_CLIENT_ID` - Client ID из Avito API
-- `AVITO_CLIENT_SECRET` - Client Secret из Avito API
 - `AVITO_ACCOUNT_ID` - Account ID из Avito API
+- `AVITO_CLIENT_ID` / `AVITO_CLIENT_SECRET` - credentials приложения Avito (если один набор на все аккаунты)
+- `AVITO_ACCOUNTS_CREDENTIALS_JSON` - (рекомендуется) per-account credentials в виде JSON в env
 - `OPENAI_API_KEY` - API ключ OpenAI
 
 **Опциональные переменные:**
@@ -100,6 +100,9 @@ scp .env root@your-server-ip:/home/avito_autoanswer_bot/.env
 - `COOLDOWN_MINUTES_AFTER_MANAGER` - время паузы после ответа менеджера (по умолчанию: 15)
 - `MANAGER_COST_PER_HOUR` - стоимость работы менеджера в час (для статистики)
 - `USD_RATE` - курс доллара (для статистики)
+- `LOG_LEVEL` - уровень логирования (DEBUG/INFO/WARNING/ERROR)
+- `LOG_PII` - логировать ли тексты/истории (0/1). По умолчанию 0 (privacy).
+- `LOG_WEBHOOK_PAYLOAD` - логировать ли raw webhook payload (0/1). По умолчанию 0 (privacy).
 
 ### 2. Перезапуск сервиса
 
